@@ -45,6 +45,7 @@ pub enum ResultSet<'a> {
 
 /// `'a` is the lifetime of the owning [`Bump`]; `name`/`sql` are `'static` and
 /// never touch the arena.
+#[derive(Debug)]
 struct Body<'a> {
     /// Key for the connection's statement cache.
     name: &'static str,
@@ -63,6 +64,8 @@ self_cell!(
         #[covariant]
         dependent: Body,
     }
+
+    impl {Debug}
 );
 
 // SAFETY: `Bump` is `!Send` only by `NonNull`'s conservative auto-trait; it has
@@ -93,6 +96,26 @@ impl Request {
                 result: ResultSet::Building,
             }
         })
+    }
+
+    /// Opens a write transaction: turso classes it as a write, so it lands on
+    /// the writer.
+    pub fn begin_write() -> Self {
+        Request::prepared("__begin_write", "BEGIN IMMEDIATE", &[])
+    }
+
+    /// Opens a read transaction: turso classes it as read-only, so it lands on
+    /// a reader.
+    pub fn begin_read() -> Self {
+        Request::prepared("__begin_read", "BEGIN", &[])
+    }
+
+    pub fn commit() -> Self {
+        Request::prepared("__commit", "COMMIT", &[])
+    }
+
+    pub fn rollback() -> Self {
+        Request::prepared("__rollback", "ROLLBACK", &[])
     }
 
     pub fn name(&self) -> &'static str {

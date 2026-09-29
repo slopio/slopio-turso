@@ -117,62 +117,77 @@ async fn queries() {
     assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(4))));
 }
 
-/// Interactive transactions, driven by hand: the id comes back on the `BEGIN`
-/// and is stamped on every request that belongs to it.
+/// Interactive transactions through their token.
 async fn transactions() {
     let client = Client::new(DB_THREAD);
-    let query = |name, sql, params: &[ValueRef<'_>]| Request::prepared(name, sql, params);
     let count = || async move {
         let done = client
-            .query(query("count", "SELECT count(*) FROM users", &[]))
+            .query(Request::prepared(
+                "count",
+                "SELECT count(*) FROM users",
+                &[],
+            ))
             .await;
         match done.rows_iter().next().unwrap()[0] {
             ValueRef::Numeric(Numeric::Integer(n)) => n,
             other => panic!("not a count: {other:?}"),
         }
     };
-    let eve = Value::from_text("eve");
-    let insert_eve = || query("insert", "INSERT INTO users VALUES (?1)", &[eve.as_ref()]);
+    let insert = |name: &str| {
+        let name = Value::from_text(name.to_owned());
+        Request::prepared("insert", "INSERT INTO users VALUES (?1)", &[name.as_ref()])
+    };
     let before = count().await;
 
-    // Write transaction: pinned to the writer.
-    let begin = client
-        .query(query("begin_write", "BEGIN IMMEDIATE", &[]))
-        .await;
-    let id = begin
-        .transaction()
-        .expect("BEGIN IMMEDIATE opened a transaction");
-    assert_eq!(id.connection(), 0);
-    let done = client.query(insert_eve().in_transaction(id)).await;
+    // Commit: readers see the rows only afterwards.
+    let tx = client.begin_write().await.unwrap();
+    assert_eq!(
+        tx.id().connection(),
+        0,
+        "write transactions run on the writer"
+    );
+    let (tx, done) = client.query_in(tx, insert("eve")).await;
     assert!(matches!(
         done.result(),
         ResultSet::Command { changes: 1, .. }
     ));
-    assert_eq!(count().await, before, "readers don't see uncommitted rows");
-    let done = client
-        .query(query("commit", "COMMIT", &[]).in_transaction(id))
+    // In turso a failed statement leaves the transaction open.
+    let (tx, done) = client
+        .query_in(tx, Request::prepared("bad", "SELECT * FROM missing", &[]))
         .await;
-    assert!(matches!(done.result(), ResultSet::Command { .. }));
+    assert!(matches!(done.result(), ResultSet::Error(_)));
+    assert_eq!(count().await, before, "readers don't see uncommitted rows");
+    client.commit(tx).await.unwrap();
     assert_eq!(count().await, before + 1);
 
-    // Over: its id is refused rather than run outside the transaction.
-    let done = client.query(insert_eve().in_transaction(id)).await;
+    // Dropping the token rolls back, and frees the writer for other writes.
+    let tx = client.begin_write().await.unwrap();
+    let (tx, _) = client.query_in(tx, insert("fay")).await;
+    drop(tx);
+    let done = client.query(insert("gus")).await;
+    assert!(matches!(
+        done.result(),
+        ResultSet::Command { changes: 1, .. }
+    ));
+    assert_eq!(count().await, before + 2, "fay rolled back, gus inserted");
+
+    // Read transaction: on a reader, which refuses writes.
+    let tx = client.begin_read().await.unwrap();
+    assert_ne!(tx.id().connection(), 0, "read transactions run on a reader");
+    let (tx, done) = client.query_in(tx, insert("hal")).await;
+    assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
+    client.rollback(tx).await.unwrap();
+
+    // A request naming a transaction that is over is refused, not run.
+    let tx = client.begin_write().await.unwrap();
+    let id = tx.id();
+    client.commit(tx).await.unwrap();
+    let done = client.query(insert("ivy").in_transaction(id)).await;
     assert!(matches!(
         done.result(),
         ResultSet::Error(Error::TransactionEnded)
     ));
-
-    // Read transaction: pinned to a reader, which refuses writes.
-    let begin = client.query(query("begin_read", "BEGIN", &[])).await;
-    let id = begin.transaction().expect("BEGIN opened a transaction");
-    assert_ne!(id.connection(), 0);
-    let done = client.query(insert_eve().in_transaction(id)).await;
-    assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
-    let done = client
-        .query(query("rollback", "ROLLBACK", &[]).in_transaction(id))
-        .await;
-    assert!(matches!(done.result(), ResultSet::Command { .. }));
-    assert_eq!(count().await, before + 1);
+    assert_eq!(count().await, before + 2);
 }
 
 #[test]
