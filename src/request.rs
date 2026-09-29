@@ -134,9 +134,9 @@ impl Request {
     }
 
     /// Copies one row (`stmt.row().get_values()`) into the arena.
-    pub fn push_row<'v>(&mut self, values: impl ExactSizeIterator<Item = &'v Value>) {
+    pub fn push_row<'v>(&mut self, values: impl Iterator<Item = &'v Value>) {
         self.with_dependent_mut(|bump, b| {
-            let mut row = BumpVec::with_capacity_in(values.len(), bump);
+            let mut row = BumpVec::with_capacity_in(values.size_hint().0, bump);
             for value in values {
                 row.push(copy_into(bump, value.as_ref()));
             }
