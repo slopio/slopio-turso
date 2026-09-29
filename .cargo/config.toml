@@ -1,0 +1,4 @@
+# slopio is a private repo: let cargo use the system git (and its SSH setup)
+# instead of libgit2 to fetch it.
+[net]
+git-fetch-with-cli = true
