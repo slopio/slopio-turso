@@ -68,6 +68,11 @@ impl Conn {
         self.running.is_none()
     }
 
+    /// Whether a `BEGIN` left the connection inside a transaction.
+    pub(crate) fn in_transaction(&self) -> bool {
+        !self.conn.get_auto_commit()
+    }
+
     /// Prepares the request's statement on first use and binds its params.
     pub(crate) fn start(&mut self, request: &mut Request) -> Step {
         debug_assert!(self.is_idle(), "one request at a time");

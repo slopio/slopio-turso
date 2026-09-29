@@ -24,6 +24,8 @@ pub enum Error {
     Cancelled,
     /// The result grew past the row limit; the rows read so far are dropped.
     TooManyRows,
+    /// The request names a transaction that is no longer open.
+    TransactionEnded,
 }
 
 /// The outcome of one request. Exactly one case holds at the end, so illegal

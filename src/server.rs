@@ -2,6 +2,11 @@
 //! them on turso connections — one writer and a few readers — taking turns a
 //! few steps at a time.
 //!
+//! A `BEGIN` pins its connection to an interactive transaction until turso says
+//! it is over: `BEGIN` (read-only to turso) opens a read transaction on a
+//! reader, `BEGIN IMMEDIATE` a write transaction on the writer. Readers are
+//! query-only, so a write inside a read transaction fails.
+//!
 //! This is the other half of the handoff protocol in [`crate::pending`].
 
 use std::collections::VecDeque;
@@ -20,6 +25,8 @@ use turso_core::{Database, IO, LimboError};
 
 use crate::conn::{Conn, Step};
 use crate::pending::Pending;
+use crate::request::Error;
+use crate::transaction::TransactionId;
 
 type Msg = Arc<Message<Pending>>;
 
@@ -37,11 +44,16 @@ pub struct Server {
 
 impl Server {
     pub fn new(db: &Arc<Database>, readers: usize, max_rows: usize) -> Result<Self, LimboError> {
-        let slot = || Ok::<_, LimboError>(Slot::new(Conn::new(db.connect()?, max_rows)));
+        let slot = |index: u16, query_only: bool| {
+            let conn = db.connect()?;
+            conn.set_query_only(query_only);
+            Ok::<_, LimboError>(Slot::new(index, Conn::new(conn, max_rows)))
+        };
+        let readers = u16::try_from(readers).expect("fewer than 65535 readers");
         Ok(Server {
-            writer: slot()?,
-            readers: iter::repeat_with(slot)
-                .take(readers)
+            writer: slot(0, false)?,
+            readers: (1..=readers)
+                .map(|index| slot(index, true))
                 .collect::<Result<_, _>>()?,
             writes: VecDeque::new(),
             reads: VecDeque::new(),
@@ -74,10 +86,18 @@ impl Server {
         }
     }
 
-    /// Queues a request for the writer or the readers.
+    /// Queues a request for its transaction's connection, or else for the
+    /// writer or the readers.
     fn accept(&mut self, msg: Msg) {
         // SAFETY: rule 2 — ours until we reply.
         let request = unsafe { msg.payload.request() };
+        if let Some(id) = request.transaction() {
+            match self.slot_mut(id.connection()) {
+                Some(slot) if slot.transaction == Some(id) => slot.transaction_queue.push_back(msg),
+                _ => fail(msg, Error::TransactionEnded),
+            }
+            return;
+        }
         // SQL that fails to prepare counts as a write: the writer reports the error.
         if self.writer.conn.is_readonly(request).unwrap_or(false) {
             self.reads.push_back(msg);
@@ -120,8 +140,16 @@ impl Server {
     fn is_idle(&self) -> bool {
         self.writes.is_empty()
             && self.reads.is_empty()
-            && self.writer.running.is_none()
-            && self.readers.iter().all(|slot| slot.running.is_none())
+            && iter::once(&self.writer)
+                .chain(&self.readers)
+                .all(|slot| slot.running.is_none() && slot.transaction_queue.is_empty())
+    }
+
+    fn slot_mut(&mut self, index: u16) -> Option<&mut Slot> {
+        match index {
+            0 => Some(&mut self.writer),
+            i => self.readers.get_mut(usize::from(i) - 1),
+        }
     }
 
     fn slots_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
@@ -139,24 +167,42 @@ enum Wait {
 
 /// A connection and the request it is running, if any.
 struct Slot {
+    /// 0 for the writer, then the readers; the connection field of the
+    /// transaction ids minted here.
+    index: u16,
     conn: Conn,
     running: Option<Msg>,
     wait: Wait,
+    /// The interactive transaction this connection is pinned to, if any.
+    transaction: Option<TransactionId>,
+    /// Requests of that transaction waiting for the connection.
+    transaction_queue: VecDeque<Msg>,
+    /// Counter field of the next transaction id minted here.
+    next_transaction: u32,
 }
 
 impl Slot {
-    fn new(conn: Conn) -> Self {
+    fn new(index: u16, conn: Conn) -> Self {
         Slot {
+            index,
             conn,
             running: None,
             wait: Wait::Ready,
+            transaction: None,
+            transaction_queue: VecDeque::new(),
+            next_transaction: 0,
         }
     }
 
-    /// Starts queued requests until one is running.
+    /// Starts queued requests until one is running. A connection pinned to a
+    /// transaction only takes that transaction's requests.
     fn fill(&mut self, queue: &mut VecDeque<Msg>) {
         while self.running.is_none() {
-            let Some(msg) = queue.pop_front() else {
+            let next = match self.transaction {
+                Some(_) => self.transaction_queue.pop_front(),
+                None => queue.pop_front(),
+            };
+            let Some(msg) = next else {
                 return;
             };
             if msg.payload.is_cancelled() {
@@ -166,7 +212,7 @@ impl Slot {
             // SAFETY: rule 2 — ours until we reply.
             let request = unsafe { msg.payload.request_mut() };
             match self.conn.start(request) {
-                Step::Done => reply(msg),
+                Step::Done => self.finish(msg),
                 _ => {
                     self.running = Some(msg);
                     self.wait = Wait::Ready;
@@ -204,9 +250,34 @@ impl Slot {
                 Step::Ready => self.wait = Wait::Ready,
                 Step::Io => self.wait = Wait::Io,
                 Step::Sleep(duration) => self.wait = Wait::Until(Instant::now() + duration),
-                Step::Done => reply(self.running.take().unwrap()),
+                Step::Done => {
+                    let msg = self.running.take().unwrap();
+                    self.finish(msg);
+                }
             }
         }
+    }
+
+    /// Replies, after pinning the connection if the request opened a
+    /// transaction, or unpinning it if the request ended one.
+    fn finish(&mut self, msg: Msg) {
+        match (self.transaction, self.conn.in_transaction()) {
+            (None, true) => {
+                let id = TransactionId::compose(self.index, self.next_transaction);
+                self.next_transaction = self.next_transaction.wrapping_add(1);
+                self.transaction = Some(id);
+                // SAFETY: rule 2 — not signalled yet, so still ours to write to.
+                unsafe { msg.payload.request_mut() }.set_transaction(id);
+            }
+            (Some(_), false) => {
+                self.transaction = None;
+                for queued in self.transaction_queue.drain(..) {
+                    fail(queued, Error::TransactionEnded);
+                }
+            }
+            _ => {}
+        }
+        reply(msg);
     }
 
     /// The IO backend made progress, or failed.
@@ -219,7 +290,7 @@ impl Slot {
             // SAFETY: rule 2 — ours until we reply.
             self.conn
                 .abort(unsafe { msg.payload.request_mut() }, err.clone());
-            reply(msg);
+            self.finish(msg);
         }
     }
 }
@@ -240,6 +311,13 @@ async fn try_recv() -> Option<Msg> {
         })
     })
     .await
+}
+
+/// Answers `msg` with `err` without running it.
+fn fail(msg: Msg, err: Error) {
+    // SAFETY: rule 2 — not signalled yet, so still ours to write to.
+    unsafe { msg.payload.request_mut() }.set_error(err);
+    reply(msg);
 }
 
 /// Wakes the caller. We release our clone *before* signalling, so the caller
