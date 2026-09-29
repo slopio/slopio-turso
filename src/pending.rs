@@ -53,6 +53,11 @@ impl Pending {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// For the DB thread to watch while the request runs.
+    pub(crate) fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancelled
+    }
+
     /// # Safety
     /// No `&mut` from [`request_mut`](Self::request_mut) may be live on any
     /// thread: the DB thread before it has signalled, or the caller after its

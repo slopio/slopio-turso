@@ -7,12 +7,17 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZero;
+use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::time::Duration;
 
 use turso_core::{Connection, LimboError, Statement, StepResult};
 
 use crate::request::{Error, Request};
+
+/// How many VM instructions run between two looks at the cancel flag.
+const CANCEL_CHECK_OPS: u64 = 1000;
 
 /// What to do before stepping again.
 #[derive(Debug, PartialEq, Eq)]
@@ -32,17 +37,29 @@ pub(crate) struct Conn {
     statements: HashMap<&'static str, Statement>,
     /// Name of the statement in flight, if any.
     running: Option<&'static str>,
-    interrupted: bool,
+    /// The running request's cancel flag, set only for the duration of a step:
+    /// turso's progress handler reads it from inside the step.
+    cancel_flag: Arc<AtomicPtr<AtomicBool>>,
     max_rows: usize,
 }
 
 impl Conn {
     pub(crate) fn new(conn: Arc<Connection>, max_rows: usize) -> Self {
+        // A single step can run for a long time (an aggregate, a sort) before it
+        // returns, so the flag is checked from inside it, not between steps.
+        let cancel_flag = Arc::new(AtomicPtr::new(ptr::null_mut()));
+        let flag = Arc::clone(&cancel_flag);
+        let cancelled = move || {
+            let flag: *const AtomicBool = flag.load(Ordering::Relaxed);
+            // SAFETY: non-null only while `step` runs, which borrows the flag.
+            !flag.is_null() && unsafe { &*flag }.load(Ordering::Relaxed)
+        };
+        conn.set_progress_handler(CANCEL_CHECK_OPS, Some(Box::new(cancelled)));
         Conn {
             conn,
             statements: HashMap::new(),
             running: None,
-            interrupted: false,
+            cancel_flag,
             max_rows,
         }
     }
@@ -57,7 +74,6 @@ impl Conn {
         match self.bind(request) {
             Ok(()) => {
                 self.running = Some(request.name());
-                self.interrupted = false;
                 Step::Ready
             }
             Err(err) => {
@@ -83,22 +99,28 @@ impl Conn {
         Ok(())
     }
 
-    /// Advances the running request once. `cancelled` comes from its `Pending`.
-    pub(crate) fn step(&mut self, request: &mut Request, cancelled: bool) -> Step {
+    /// Ends the running request with `err`, e.g. when the IO backend failed.
+    pub(crate) fn abort(&mut self, request: &mut Request, err: LimboError) {
+        if let Some(name) = self.running.take() {
+            // The statement may be mid-IO, so this can block; the IO is broken anyway.
+            let _ = self.statements.get_mut(name).map(Statement::reset);
+        }
+        request.set_error(Error::Turso(err));
+    }
+
+    /// Advances the running request once. `cancelled` is its `Pending`'s flag;
+    /// once set, the step ends as `Cancelled` within a few instructions.
+    pub(crate) fn step(&mut self, request: &mut Request, cancelled: &AtomicBool) -> Step {
         let name = self.running.expect("a request is running");
         let stmt = self
             .statements
             .get_mut(name)
             .expect("running statement is cached");
-        if cancelled && !self.interrupted {
-            // Not `stmt.interrupt()`: the next step overwrites that state with
-            // `Running` (turso 0.8.1). The connection flag is checked on every
-            // instruction and cleared once no statement is active; we only
-            // ever run one, so it interrupts exactly this request.
-            self.conn.interrupt();
-            self.interrupted = true;
-        }
-        let outcome = match stmt.step() {
+        self.cancel_flag
+            .store(ptr::from_ref(cancelled).cast_mut(), Ordering::Relaxed);
+        let stepped = stmt.step();
+        self.cancel_flag.store(ptr::null_mut(), Ordering::Relaxed);
+        let outcome = match stepped {
             Ok(StepResult::Row) if request.row_count() >= Some(self.max_rows) => {
                 Err(Error::TooManyRows)
             }
@@ -147,7 +169,7 @@ mod tests {
             if step == Step::Io {
                 conn.conn.get_pager().io.step().unwrap();
             }
-            step = conn.step(&mut request, false);
+            step = conn.step(&mut request, &AtomicBool::new(false));
         }
         request
     }
@@ -261,18 +283,17 @@ mod tests {
     }
 
     #[test]
-    fn cancel_interrupts() {
-        let mut conn = open("cancel_interrupts", 100);
+    fn cancel_interrupts_a_long_step() {
+        let mut conn = open("cancel_interrupts_a_long_step", 100);
+        // One row, at the very end: the whole count runs inside a single step.
         let mut request = Request::prepared(
-            "forever",
-            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c",
+            "count",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c",
             &[],
         );
         conn.start(&mut request);
-        for _ in 0..10 {
-            conn.step(&mut request, false);
-        }
-        while conn.step(&mut request, true) != Step::Done {}
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(conn.step(&mut request, &cancelled), Step::Done);
         assert!(matches!(
             request.result(),
             ResultSet::Error(Error::Cancelled)
