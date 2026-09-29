@@ -12,6 +12,8 @@ use self_cell::self_cell;
 use turso_core::types::TextRef;
 use turso_core::{LimboError, Value, ValueRef};
 
+use crate::transaction::TransactionId;
+
 /// One row: its columns, each borrowing the arena. The spine lives in the
 /// arena too — no heap allocation per row.
 type Row<'a> = BumpVec<'a, ValueRef<'a>>;
@@ -47,6 +49,8 @@ struct Body<'a> {
     /// Prepared on first use per connection.
     sql: &'static str,
     params: BumpVec<'a, ValueRef<'a>>,
+    /// `None` outside an interactive transaction.
+    transaction: Option<TransactionId>,
     result: ResultSet<'a>,
 }
 
@@ -83,6 +87,7 @@ impl Request {
                 name,
                 sql,
                 params: bound,
+                transaction: None,
                 result: ResultSet::Building,
             }
         })
@@ -98,6 +103,22 @@ impl Request {
 
     pub fn params(&self) -> &[ValueRef<'_>] {
         &self.borrow_dependent().params[..]
+    }
+
+    pub fn transaction(&self) -> Option<TransactionId> {
+        self.borrow_dependent().transaction
+    }
+
+    /// Consumes and returns `self` so it composes in a builder chain.
+    pub fn in_transaction(mut self, id: TransactionId) -> Self {
+        self.set_transaction(id);
+        self
+    }
+
+    /// Used by the DB thread to stamp a freshly-minted id onto the request that
+    /// opened a transaction, so it rides back to the caller in the reply.
+    pub fn set_transaction(&mut self, id: TransactionId) {
+        self.with_dependent_mut(|_bump, b| b.transaction = Some(id));
     }
 
     pub fn result(&self) -> &ResultSet<'_> {
@@ -220,6 +241,14 @@ mod tests {
         request.begin_rows();
         request.finish_command(0, 0);
         assert_eq!(request.row_count(), Some(0));
+    }
+
+    #[test]
+    fn transaction_rides_along() {
+        let request = Request::prepared("one", "SELECT 1", &[]);
+        assert_eq!(request.transaction(), None);
+        let id = TransactionId::compose(1, 42);
+        assert_eq!(request.in_transaction(id).transaction(), Some(id));
     }
 
     #[test]
