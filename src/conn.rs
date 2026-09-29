@@ -83,11 +83,23 @@ impl Conn {
         }
     }
 
-    fn bind(&mut self, request: &mut Request) -> Result<(), LimboError> {
-        let stmt = match self.statements.entry(request.name()) {
+    /// Whether the request only reads, preparing its statement on first use.
+    ///
+    /// Follows `sqlite3_stmt_readonly`, which counts `BEGIN` and `COMMIT` as
+    /// read-only.
+    pub(crate) fn is_readonly(&mut self, request: &Request) -> Result<bool, LimboError> {
+        Ok(self.prepared(request)?.get_program().is_readonly())
+    }
+
+    fn prepared(&mut self, request: &Request) -> Result<&mut Statement, LimboError> {
+        Ok(match self.statements.entry(request.name()) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(self.conn.prepare(request.sql())?),
-        };
+        })
+    }
+
+    fn bind(&mut self, request: &mut Request) -> Result<(), LimboError> {
+        let stmt = self.prepared(request)?;
         // Parameters left over from a previous run would otherwise leak in.
         stmt.clear_bindings();
         for (index, param) in (1..).zip(request.params()) {

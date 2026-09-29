@@ -7,13 +7,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use slopio::runtime::join::join4;
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
 use slopio_turso::request::{Error, Request, ResultSet};
-use slopio_turso::server::serve;
+use slopio_turso::server::Server;
 use turso_core::{Database, MemoryIO, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
@@ -24,7 +25,7 @@ async fn db_thread() {
     let io = Arc::new(MemoryIO::new());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
     let db = Database::open(io.clone(), "serve.db", options).unwrap();
-    let serving = serve(io, db.connect().unwrap(), 100);
+    let serving = Server::new(&db, 2, 100).unwrap().serve(io);
     match select(serving, select(recv_from_peer(), Sleep::during(TIMEOUT))).await {
         SelectResult::First(()) => unreachable!("serve never returns"),
         SelectResult::Second(SelectResult::First(_stop)) => {}
@@ -80,9 +81,36 @@ async fn queries() {
         SelectResult::First(_) => panic!("the query should still be running"),
         SelectResult::Second(()) => {}
     }
+    // Several requests in flight at once: the writes queue for the writer,
+    // the reads spread over the readers.
+    let (a, b, c, d) = join4(
+        run(
+            "insert",
+            "INSERT INTO users VALUES (?1)",
+            &[Value::from_text("cy").as_ref()],
+        ),
+        run("names", "SELECT name FROM users ORDER BY name", &[]),
+        run(
+            "insert",
+            "INSERT INTO users VALUES (?1)",
+            &[Value::from_text("dee").as_ref()],
+        ),
+        run("names", "SELECT name FROM users ORDER BY name", &[]),
+    )
+    .await;
+    for write in [a, c] {
+        assert!(matches!(
+            write.result(),
+            ResultSet::Command { changes: 1, .. }
+        ));
+    }
+    for read in [b, d] {
+        assert!(matches!(read.result(), ResultSet::Rows(_)));
+    }
+
     let done = run("count", "SELECT count(*) FROM users", &[]).await;
     let count = done.rows_iter().next().unwrap()[0];
-    assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(2))));
+    assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(4))));
 }
 
 #[test]
