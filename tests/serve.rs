@@ -141,6 +141,23 @@ async fn queries() {
         assert!(matches!(read.result(), ResultSet::Rows(_)));
     }
 
+    // Writes in flight together share a batch: a failing one leaves the others
+    // alone, and each reports its own result.
+    run("create_tags", "CREATE TABLE tags (name TEXT UNIQUE)", &[]).await;
+    let [x, y, z] = ["x", "y", "z"].map(Value::from_text);
+    let tag = |name: &Value| run("tag", "INSERT INTO tags VALUES (?1)", &[name.as_ref()]);
+    let (a, b, c, d) = join4(tag(&x), tag(&y), tag(&x), tag(&z)).await;
+    let failed = [&a, &b, &c, &d].map(|done| matches!(done.result(), ResultSet::Error(_)));
+    assert_eq!(
+        failed.iter().filter(|&&f| f).count(),
+        1,
+        "only the duplicate fails"
+    );
+    assert!(!failed[1] && !failed[3]);
+    let done = run("count_tags", "SELECT count(*) FROM tags", &[]).await;
+    let tags = done.rows_iter().next().unwrap()[0];
+    assert!(matches!(tags, ValueRef::Numeric(Numeric::Integer(3))));
+
     let done = run("count", "SELECT count(*) FROM users", &[]).await;
     let count = done.rows_iter().next().unwrap()[0];
     assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(4))));

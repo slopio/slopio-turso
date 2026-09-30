@@ -35,6 +35,8 @@ pub(crate) enum Step {
 pub(crate) struct Conn {
     conn: Arc<Connection>,
     statements: HashMap<&'static str, Statement>,
+    /// The DB thread's own statements, keyed by their SQL.
+    internal: HashMap<&'static str, Statement>,
     /// Name of the statement in flight, if any.
     running: Option<&'static str>,
     /// The running request's cancel flag, set only for the duration of a step:
@@ -58,6 +60,7 @@ impl Conn {
         Conn {
             conn,
             statements: HashMap::new(),
+            internal: HashMap::new(),
             running: None,
             cancel_flag,
             max_rows,
@@ -114,6 +117,21 @@ impl Conn {
             request.begin_rows();
         }
         Ok(())
+    }
+
+    /// Runs one of the DB thread's own statements (`BEGIN`, `SAVEPOINT`…) to
+    /// completion, prepared on first use. Blocks on its IO: all of them run in
+    /// memory but `COMMIT`, whose fsync would block the thread inside
+    /// `IO::step` anyway.
+    pub(crate) fn run_internal(&mut self, sql: &'static str) -> Result<(), LimboError> {
+        debug_assert!(self.is_idle(), "no request may be running");
+        let stmt = match self.internal.entry(sql) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(self.conn.prepare(sql)?),
+        };
+        let ran = stmt.run_ignore_rows();
+        let reset = stmt.reset();
+        ran.and(reset)
     }
 
     /// Ends the running request with `err`, e.g. when the IO backend failed.

@@ -8,6 +8,11 @@
 //! query-only, so a write inside a read transaction fails. A transaction left
 //! idle past [`Config::transaction_timeout`] is rolled back by the DB thread.
 //!
+//! The writer batches: writes queued together run in one transaction, each
+//! under its own savepoint so a failing one leaves the others alone, and share
+//! a single `COMMIT` — one fsync. A write is only answered once that commit
+//! succeeded; a failed one is answered at once.
+//!
 //! This is the other half of the handoff protocol in [`crate::pending`].
 
 use std::collections::VecDeque;
@@ -26,13 +31,16 @@ use turso_core::{Database, IO, LimboError};
 
 use crate::conn::{Conn, Step};
 use crate::pending::Pending;
-use crate::request::{Error, Request};
+use crate::request::{Error, Request, ResultSet};
 use crate::transaction::TransactionId;
 
 type Msg = Arc<Message<Pending>>;
 
 /// Steps a connection takes in a row before the others get their turn.
 const STEPS_PER_TURN: usize = 64;
+
+/// Writes one batch holds at most before it commits.
+const MAX_BATCH: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -72,7 +80,8 @@ impl Server {
         let slot = |index: u16, query_only: bool| {
             let conn = db.connect()?;
             conn.set_query_only(query_only);
-            Ok::<_, LimboError>(Slot::new(index, Conn::new(conn, config.max_rows)))
+            let conn = Conn::new(conn, config.max_rows);
+            Ok::<_, LimboError>(Slot::new(index, conn, !query_only))
         };
         Ok(Server {
             writer: slot(0, false)?,
@@ -205,10 +214,14 @@ struct Slot {
     next_transaction: u32,
     /// Since when the transaction has had no request running or queued.
     idle_since: Option<Instant>,
+    /// Whether writes queued together share a transaction: the writer only.
+    batches: bool,
+    /// The open batch: writes that succeeded in it, answered once it commits.
+    batch: Option<Vec<Msg>>,
 }
 
 impl Slot {
-    fn new(index: u16, conn: Conn) -> Self {
+    fn new(index: u16, conn: Conn, batches: bool) -> Self {
         Slot {
             index,
             conn,
@@ -218,6 +231,8 @@ impl Slot {
             transaction_queue: VecDeque::new(),
             next_transaction: 0,
             idle_since: None,
+            batches,
+            batch: None,
         }
     }
 
@@ -230,6 +245,9 @@ impl Slot {
                 None => queue.pop_front(),
             };
             let Some(msg) = next else {
+                // Nothing more to add right now: make the batch durable. Writes
+                // arriving meanwhile queue up and form the next one.
+                self.commit_batch();
                 return;
             };
             if msg.payload.is_cancelled() {
@@ -239,6 +257,15 @@ impl Slot {
             self.idle_since = None;
             // SAFETY: rule 2 — ours until we reply.
             let request = unsafe { msg.payload.request_mut() };
+            if self.batches && self.transaction.is_none() {
+                if controls_transaction(request.sql()) {
+                    // It would end or nest inside the batch: run it on its own.
+                    self.commit_batch();
+                } else if let Err(err) = self.enter_batch() {
+                    fail(msg, Error::Turso(err));
+                    continue;
+                }
+            }
             match self.conn.start(request) {
                 Step::Done => self.finish(msg),
                 _ => {
@@ -306,9 +333,77 @@ impl Slot {
         }
     }
 
+    /// Opens the batch if none is, then a savepoint for the next write in it.
+    fn enter_batch(&mut self) -> Result<(), LimboError> {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|held| held.len() >= MAX_BATCH)
+        {
+            self.commit_batch();
+        }
+        if self.batch.is_none() {
+            self.conn.run_internal("BEGIN IMMEDIATE")?;
+            self.batch = Some(Vec::new());
+        }
+        self.conn.run_internal("SAVEPOINT batch")
+    }
+
+    /// Settles a write that ran in the batch: a failed one is undone and
+    /// answered at once; a successful one waits for the commit.
+    fn leave_batch(&mut self, msg: Msg) {
+        // SAFETY: rule 2 — not signalled yet, so still ours.
+        let failed = matches!(
+            unsafe { msg.payload.request() }.result(),
+            ResultSet::Error(_)
+        );
+        let undone = if failed {
+            self.conn.run_internal("ROLLBACK TO batch")
+        } else {
+            Ok(())
+        };
+        let released = undone.and_then(|()| self.conn.run_internal("RELEASE batch"));
+        match (released, failed) {
+            (Ok(()), true) => reply(msg),
+            (Ok(()), false) => self.batch.as_mut().unwrap().push(msg),
+            // The batch's state is unknown: give it up, this write with it.
+            (Err(err), _) => {
+                self.batch.as_mut().unwrap().push(msg);
+                self.abort_batch(err);
+            }
+        }
+    }
+
+    /// Makes the batch durable with one `COMMIT`, then answers every write in
+    /// it.
+    fn commit_batch(&mut self) {
+        if self.batch.is_none() {
+            return;
+        }
+        match self.conn.run_internal("COMMIT") {
+            Ok(()) => self.batch.take().unwrap().into_iter().for_each(reply),
+            Err(err) => self.abort_batch(err),
+        }
+    }
+
+    /// Rolls the batch back and fails every write in it with `err`: none of
+    /// them is durable.
+    fn abort_batch(&mut self, err: LimboError) {
+        let _ = self.conn.run_internal("ROLLBACK");
+        for msg in self.batch.take().unwrap_or_default() {
+            fail(msg, Error::Turso(err.clone()));
+        }
+    }
+
     /// Replies, after pinning the connection if the request opened a
     /// transaction, or unpinning it if the request ended one.
     fn finish(&mut self, msg: Msg) {
+        if self.batch.is_some() {
+            // Our own `BEGIN` holds the connection in a transaction: not the
+            // caller's to pin.
+            self.leave_batch(msg);
+            return;
+        }
         match (self.transaction, self.conn.in_transaction()) {
             (None, true) => {
                 let id = TransactionId::compose(self.index, self.next_transaction);
@@ -344,6 +439,19 @@ impl Slot {
             .abort(unsafe { msg.payload.request_mut() }, err.clone());
         self.finish(msg);
     }
+}
+
+/// Whether `sql` starts or ends a transaction or savepoint: inside a batch it
+/// would commit, nest in or undo the batch's own.
+fn controls_transaction(sql: &str) -> bool {
+    let keyword = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+    ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"]
+        .iter()
+        .any(|k| keyword.eq_ignore_ascii_case(k))
 }
 
 async fn recv() -> Msg {
@@ -390,4 +498,32 @@ fn reply(msg: Msg) {
     let header = msg.header;
     drop(msg);
     signal_reply_to_peer(&header, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controls_transaction;
+
+    #[test]
+    fn transaction_control_is_recognised() {
+        for sql in [
+            "BEGIN",
+            "begin immediate",
+            "  COMMIT",
+            "END TRANSACTION",
+            "ROLLBACK TO s",
+            "SAVEPOINT s",
+            "RELEASE s",
+        ] {
+            assert!(controls_transaction(sql), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET x = 1",
+            "CREATE TABLE begin_log (x)",
+            "",
+        ] {
+            assert!(!controls_transaction(sql), "{sql}");
+        }
+    }
 }
