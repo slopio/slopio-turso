@@ -10,6 +10,7 @@ use std::num::NonZero;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::task::Waker;
 use std::time::Duration;
 
 use turso_core::{Connection, LimboError, Statement, StepResult};
@@ -144,8 +145,15 @@ impl Conn {
     }
 
     /// Advances the running request once. `cancelled` is its `Pending`'s flag;
-    /// once set, the step ends as `Cancelled` within a few instructions.
-    pub(crate) fn step(&mut self, request: &mut Request, cancelled: &AtomicBool) -> Step {
+    /// once set, the step ends as `Cancelled` within a few instructions. On
+    /// `Io`, turso wakes `waker` once the operation it waits on has finished —
+    /// at once, if it already has.
+    pub(crate) fn step(
+        &mut self,
+        request: &mut Request,
+        cancelled: &AtomicBool,
+        waker: &Waker,
+    ) -> Step {
         let name = self.running.expect("a request is running");
         let stmt = self
             .statements
@@ -153,7 +161,7 @@ impl Conn {
             .expect("running statement is cached");
         self.cancel_flag
             .store(ptr::from_ref(cancelled).cast_mut(), Ordering::Relaxed);
-        let stepped = stmt.step();
+        let stepped = stmt.step_with_waker(waker);
         self.cancel_flag.store(ptr::null_mut(), Ordering::Relaxed);
         let outcome = match stepped {
             Ok(StepResult::Row) if request.row_count() >= Some(self.max_rows) => {
@@ -204,7 +212,7 @@ mod tests {
             if step == Step::Io {
                 conn.conn.get_pager().io.step().unwrap();
             }
-            step = conn.step(&mut request, &AtomicBool::new(false));
+            step = conn.step(&mut request, &AtomicBool::new(false), Waker::noop());
         }
         request
     }
@@ -328,7 +336,10 @@ mod tests {
         );
         conn.start(&mut request);
         let cancelled = AtomicBool::new(true);
-        assert_eq!(conn.step(&mut request, &cancelled), Step::Done);
+        assert_eq!(
+            conn.step(&mut request, &cancelled, Waker::noop()),
+            Step::Done
+        );
         assert!(matches!(
             request.result(),
             ResultSet::Error(Error::Cancelled)

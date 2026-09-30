@@ -48,10 +48,14 @@ impl RingIo {
         })
     }
 
-    /// Completes whatever operations are done, without waiting.
-    pub fn poll(&self) -> turso_core::Result<()> {
-        finish(self.ring.reap(false)?);
-        Ok(())
+    /// Submits what is queued and completes whatever operations are done,
+    /// without waiting. Returns how many completed; no syscall when there was
+    /// nothing to submit.
+    pub fn poll(&self) -> turso_core::Result<usize> {
+        let done = self.ring.reap(false)?;
+        let count = done.len();
+        finish(done);
+        Ok(count)
     }
 
     /// Readable once completions are waiting to be reaped by [`poll`](Self::poll).
@@ -188,13 +192,19 @@ impl Ring {
         let mut done = Vec::new();
         loop {
             let want = usize::from(wait && done.is_empty() && state.in_flight > 0);
-            match state.ring.submit_and_wait(want) {
-                Ok(_) => {}
-                // A signal cut the wait short, or the completion queue is full:
-                // reap below and go round again.
-                Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::ResourceBusy) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                Err(e) => return Err(io_error(e, "io_uring_enter")),
+            // Finished operations are read straight from the shared completion
+            // queue: enter the kernel only to submit or to wait.
+            if want > 0 || !state.ring.submission().is_empty() {
+                match state.ring.submit_and_wait(want) {
+                    Ok(_) => {}
+                    // A signal cut the wait short, or the completion queue is
+                    // full: reap below and go round again.
+                    Err(e)
+                        if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::ResourceBusy) => {
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                    Err(e) => return Err(io_error(e, "io_uring_enter")),
+                }
             }
             state.drain(&mut done)?;
             if want == 0 || !done.is_empty() {

@@ -16,20 +16,26 @@
 //! This is the other half of the handoff protocol in [`crate::pending`].
 
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{self, poll_fn};
 use std::iter;
+use std::os::fd::RawFd;
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use slopio::io_driver::Message;
+use io_uring::opcode;
+use io_uring::types::Fd;
+use slopio::io_driver::operations::OneshotToken;
+use slopio::io_driver::{IO_DRIVER, Message};
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_msg_from_peer, signal_reply_to_peer, yield_now};
-use turso_core::{Database, IO, LimboError};
+use turso_core::{Database, LimboError};
 
 use crate::conn::{Conn, Step};
+use crate::io::RingIo;
 use crate::pending::Pending;
 use crate::request::{Error, Request, ResultSet};
 use crate::transaction::TransactionId;
@@ -96,9 +102,12 @@ impl Server {
 
     /// Serves requests forever. Run it as the root future of the DB thread.
     ///
-    /// `io` must be the backend the database was opened with. Waiting on disk
-    /// still blocks the thread (turso's backends wait inside `IO::step`).
-    pub async fn serve(mut self, io: Arc<dyn IO>) {
+    /// `io` must be the backend the database was opened with. A request
+    /// waiting on disk holds up only its own connection: the thread sleeps
+    /// only once nothing can run, until a request arrives, the disk answers,
+    /// or a deadline passes.
+    pub async fn serve(mut self, io: Arc<RingIo>) {
+        let mut disk = DiskWatch::new(io.ring_fd());
         loop {
             // Let the runtime process its completions, so requests sent since
             // the last turn reach the inbox, then take them all.
@@ -108,11 +117,12 @@ impl Server {
             }
             self.expire_transactions(Instant::now());
             self.dispatch();
+            self.poll_io(&io);
             let now = Instant::now();
             for slot in self.slots_mut() {
                 slot.take_turn(now);
             }
-            self.wait(io.as_ref()).await;
+            self.wait(&io, &mut disk).await;
         }
     }
 
@@ -152,18 +162,23 @@ impl Server {
         }
     }
 
-    /// When no request can step right now, waits for what unblocks one: the
-    /// disk, a new request, or a deadline.
-    async fn wait(&mut self, io: &dyn IO) {
-        if self.slots_mut().any(|slot| slot.wait == Wait::Io) {
-            let result = io.step();
+    /// Submits the operations the last turn queued and completes those the
+    /// disk finished: turso wakes each request whose operation it was.
+    fn poll_io(&mut self, io: &RingIo) {
+        if let Err(err) = io.poll() {
             for slot in self.slots_mut() {
-                slot.io_done(result.as_ref().err());
+                slot.io_failed(&err);
             }
-            return;
         }
-        // Connections freed this turn take their next request first.
+    }
+
+    /// When no request can step right now, sleeps until what unblocks one: a
+    /// new request, the disk, or a deadline.
+    async fn wait(&mut self, io: &RingIo, disk: &mut DiskWatch) {
+        // Connections freed this turn take their next request first, and the
+        // kernel gets what this turn queued before anything sleeps on it.
         self.dispatch();
+        self.poll_io(io);
         let now = Instant::now();
         if self.slots_mut().any(|slot| slot.is_runnable(now)) {
             return;
@@ -173,7 +188,8 @@ impl Server {
             .slots_mut()
             .filter_map(|slot| slot.deadline(timeout))
             .min();
-        if let Some(msg) = recv_until(deadline).await {
+        let on_disk = self.slots_mut().any(|slot| slot.waits_on_disk());
+        if let Some(msg) = recv_until(deadline, disk.readable(on_disk)).await {
             self.accept(msg);
         }
     }
@@ -198,6 +214,19 @@ enum Wait {
     Until(Instant),
 }
 
+/// Set by turso once the operation a request waits on has finished.
+struct IoDone(AtomicBool);
+
+impl Wake for IoDone {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// A connection and the request it is running, if any.
 struct Slot {
     /// 0 for the writer, then the readers; the connection field of the
@@ -206,6 +235,9 @@ struct Slot {
     conn: Conn,
     running: Option<Msg>,
     wait: Wait,
+    /// What turso wakes when the running request's operation has finished.
+    io_done: Arc<IoDone>,
+    waker: Waker,
     /// The interactive transaction this connection is pinned to, if any.
     transaction: Option<TransactionId>,
     /// Requests of that transaction waiting for the connection.
@@ -222,11 +254,14 @@ struct Slot {
 
 impl Slot {
     fn new(index: u16, conn: Conn, batches: bool) -> Self {
+        let io_done = Arc::new(IoDone(AtomicBool::new(false)));
         Slot {
             index,
             conn,
             running: None,
             wait: Wait::Ready,
+            waker: Waker::from(Arc::clone(&io_done)),
+            io_done,
             transaction: None,
             transaction_queue: VecDeque::new(),
             next_transaction: 0,
@@ -280,9 +315,13 @@ impl Slot {
         self.running.is_some()
             && match self.wait {
                 Wait::Ready => true,
-                Wait::Io => false,
+                Wait::Io => self.io_done.0.load(Ordering::Acquire),
                 Wait::Until(deadline) => now >= deadline,
             }
+    }
+
+    fn waits_on_disk(&self) -> bool {
+        self.running.is_some() && self.wait == Wait::Io && !self.io_done.0.load(Ordering::Acquire)
     }
 
     /// When this connection needs attention without a new request: a busy
@@ -321,7 +360,11 @@ impl Slot {
             let msg = self.running.as_ref().unwrap();
             // SAFETY: rule 2 — ours until we reply.
             let request = unsafe { msg.payload.request_mut() };
-            match self.conn.step(request, msg.payload.cancel_flag()) {
+            self.io_done.0.store(false, Ordering::Release);
+            match self
+                .conn
+                .step(request, msg.payload.cancel_flag(), &self.waker)
+            {
                 Step::Ready => self.wait = Wait::Ready,
                 Step::Io => self.wait = Wait::Io,
                 Step::Sleep(duration) => self.wait = Wait::Until(Instant::now() + duration),
@@ -424,15 +467,12 @@ impl Slot {
         reply(msg);
     }
 
-    /// The IO backend made progress, or failed.
-    fn io_done(&mut self, err: Option<&LimboError>) {
-        if self.wait != Wait::Io {
+    /// The IO backend failed: a request waiting on it ends with `err`.
+    fn io_failed(&mut self, err: &LimboError) {
+        if !self.waits_on_disk() {
             return;
         }
         self.wait = Wait::Ready;
-        let Some(err) = err else {
-            return;
-        };
         let msg = self.running.take().expect("a request waits on IO");
         // SAFETY: rule 2 — ours until we reply.
         self.conn
@@ -460,15 +500,59 @@ async fn recv() -> Msg {
     unsafe { recv_msg_from_peer::<Pending>() }.await
 }
 
-/// The next request, or `None` once `deadline` has passed.
-async fn recv_until(deadline: Option<Instant>) -> Option<Msg> {
-    let Some(deadline) = deadline else {
-        return Some(recv().await);
+/// The next request, or `None` once `disk` fires or `deadline` passes.
+async fn recv_until(deadline: Option<Instant>, disk: impl Future<Output = ()>) -> Option<Msg> {
+    let deadline = async {
+        match deadline {
+            Some(deadline) => {
+                Sleep::during(deadline.saturating_duration_since(Instant::now())).await
+            }
+            None => future::pending().await,
+        }
     };
-    let sleep = Sleep::during(deadline.saturating_duration_since(Instant::now()));
-    match select(recv(), sleep).await {
+    match select(recv(), select(disk, deadline)).await {
         SelectResult::First(msg) => Some(msg),
-        SelectResult::Second(()) => None,
+        SelectResult::Second(_) => None,
+    }
+}
+
+/// Watches the turso ring from slopio's: its fd turns readable once the disk
+/// has finished something. The watch stays armed across the sleeps it did not
+/// end, and is re-armed only once it fired.
+struct DiskWatch {
+    fd: RawFd,
+    armed: Option<OneshotToken>,
+}
+
+impl DiskWatch {
+    fn new(fd: RawFd) -> Self {
+        DiskWatch { fd, armed: None }
+    }
+
+    /// Fires once the ring has completions; never, if `watch` is false.
+    async fn readable(&mut self, watch: bool) {
+        if !watch {
+            return future::pending().await;
+        }
+        let fd = self.fd;
+        let token = *self.armed.get_or_insert_with(|| {
+            let poll = opcode::PollAdd::new(Fd(fd), libc::POLLIN as u32).build();
+            IO_DRIVER.with(|d| d.push_op(poll))
+        });
+        poll_fn(|cx| IO_DRIVER.with(|d| d.poll_op(token, cx.waker()))).await;
+        self.armed = None;
+    }
+}
+
+impl Drop for DiskWatch {
+    fn drop(&mut self) {
+        if let Some(token) = self.armed.take() {
+            IO_DRIVER.try_with(|d| {
+                if let Some(d) = d {
+                    d.cancel_single_op(token, None);
+                }
+            });
+        }
     }
 }
 
