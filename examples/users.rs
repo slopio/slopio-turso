@@ -11,10 +11,11 @@ use std::sync::Arc;
 use slopio::runtime::{recv_from_peer, send_to_peer, spawn};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
+use slopio_turso::io::RingIo;
 use slopio_turso::query::{DecodeError, Query, get_i64, get_opt_str, get_str};
 use slopio_turso::request::{Request, ResultSet};
 use slopio_turso::server::{Config, Server};
-use turso_core::{Database, OpenOptions, SqliteDialect, UringIO, Value, ValueRef};
+use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const APP_THREAD: usize = 1;
@@ -129,7 +130,7 @@ async fn app() {
 }
 
 async fn db_thread() {
-    let io = Arc::new(UringIO::new().unwrap());
+    let io = Arc::new(RingIo::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
     let db = Database::open(io.clone(), PATH, options).unwrap();
     let serving = spawn(Server::new(&db, &Config::default()).unwrap().serve(io));

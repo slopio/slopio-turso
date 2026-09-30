@@ -13,10 +13,11 @@ use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
+use slopio_turso::io::RingIo;
 use slopio_turso::query::{DecodeError, Query, get_str};
 use slopio_turso::request::{Error, Request, ResultSet};
 use slopio_turso::server::{Config, Server};
-use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UringIO, Value, ValueRef};
+use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const CLIENT_THREAD: usize = 1;
@@ -24,7 +25,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Short, so the expiry test is quick; the other transactions never idle this long.
 const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// A real file with `UringIO`, as in production: statements then wait on disk,
+/// A real file with `RingIo`, as in production: statements then wait on disk,
 /// which an in-memory database never does.
 fn db_path() -> String {
     format!("/tmp/slopio-turso-serve-{}.db", std::process::id())
@@ -49,7 +50,7 @@ impl Query for Name<'static> {
 }
 
 async fn db_thread() {
-    let io = Arc::new(UringIO::new().unwrap());
+    let io = Arc::new(RingIo::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
     let db = Database::open(io.clone(), &db_path(), options).unwrap();
     let config = Config {

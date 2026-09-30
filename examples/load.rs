@@ -1,4 +1,4 @@
-//! Load test: worker 0 runs the DB thread on a real file with `UringIO`, every
+//! Load test: worker 0 runs the DB thread on a real file with `RingIo`, every
 //! other worker is a client thread running a few tasks that send requests in a
 //! loop. Prints throughput and latency for reads and writes.
 //!
@@ -20,9 +20,10 @@ use std::time::{Duration, Instant};
 use slopio::runtime::{recv_from_peer, send_to_peer, spawn};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
+use slopio_turso::io::RingIo;
 use slopio_turso::request::{Request, ResultSet};
 use slopio_turso::server::{Config, Server};
-use turso_core::{Database, OpenOptions, SqliteDialect, UringIO, Value, ValueRef};
+use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const PATH: &str = "/tmp/slopio-turso-load.db";
@@ -129,7 +130,7 @@ fn remove_files() {
 }
 
 async fn db_thread(args: Args, clients: usize) {
-    let io = Arc::new(UringIO::new().unwrap());
+    let io = Arc::new(RingIo::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
     let db = Database::open(io.clone(), PATH, options).unwrap();
 
