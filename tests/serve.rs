@@ -13,6 +13,7 @@ use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
+use slopio_turso::query::{DecodeError, Query, get_str};
 use slopio_turso::request::{Error, Request, ResultSet};
 use slopio_turso::server::{Config, Server};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UringIO, Value, ValueRef};
@@ -32,6 +33,18 @@ fn db_path() -> String {
 fn remove_db() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db_path()));
+    }
+}
+
+/// A typed query: rows are decoded on the client, borrowing the arena.
+struct Name<'a>(&'a str);
+
+impl Query for Name<'static> {
+    type Row<'a> = Name<'a>;
+    const NAME: &'static str = "names";
+    const SQL: &'static str = "SELECT name FROM users ORDER BY name";
+    fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Name<'a>, DecodeError> {
+        Ok(Name(get_str(row, 0)?))
     }
 }
 
@@ -83,11 +96,8 @@ async fn queries() {
         ));
     }
 
-    let done = run("names", "SELECT name FROM users ORDER BY name", &[]).await;
-    let names: Vec<_> = done
-        .rows_iter()
-        .map(|row| row[0].to_text().unwrap().to_owned())
-        .collect();
+    let names = client.query_typed::<Name>(&[]).await.unwrap();
+    let names: Vec<_> = names.iter().map(|name| name.unwrap().0).collect();
     assert_eq!(names, ["ada", "bob"]);
 
     let done = run("missing", "SELECT * FROM missing", &[]).await;

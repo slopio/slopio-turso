@@ -18,7 +18,7 @@ use crate::transaction::TransactionId;
 /// arena too — no heap allocation per row.
 type Row<'a> = BumpVec<'a, ValueRef<'a>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     Turso(LimboError),
     Cancelled,

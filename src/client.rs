@@ -14,8 +14,11 @@ use std::task::{Context, Poll};
 use slopio::io_driver::{Endpoint, Header, Message};
 use slopio::runtime::{ReplySignal, send_shared_to_peer, thread_id};
 
+use turso_core::ValueRef;
+
 use crate::pending::Pending;
-use crate::request::{Request, ResultSet};
+use crate::query::{Query, Rows};
+use crate::request::{Error, Request, ResultSet};
 use crate::transaction::TransactionToken;
 
 /// A handle from a caller thread to the DB thread.
@@ -36,6 +39,13 @@ impl Client {
     /// run its query.
     pub async fn query(&self, request: Request) -> Request {
         self.start(request).await
+    }
+
+    /// Run the query `Q` with `params` and hand back its typed rows, or the
+    /// error it failed with. Rows are decoded here, on the caller's thread, as
+    /// they are iterated.
+    pub async fn query_typed<Q: Query>(&self, params: &[ValueRef<'_>]) -> Result<Rows<Q>, Error> {
+        Rows::new(self.query(Request::prepared(Q::NAME, Q::SQL, params)).await)
     }
 
     /// Put `request` in flight and hand back the future awaiting its wakeup.
