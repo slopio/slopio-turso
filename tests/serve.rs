@@ -15,7 +15,7 @@ use slopio::thread_per_core;
 use slopio_turso::client::Client;
 use slopio_turso::request::{Error, Request, ResultSet};
 use slopio_turso::server::{Config, Server};
-use turso_core::{Database, MemoryIO, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
+use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UringIO, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const CLIENT_THREAD: usize = 1;
@@ -23,10 +23,22 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Short, so the expiry test is quick; the other transactions never idle this long.
 const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// A real file with `UringIO`, as in production: statements then wait on disk,
+/// which an in-memory database never does.
+fn db_path() -> String {
+    format!("/tmp/slopio-turso-serve-{}.db", std::process::id())
+}
+
+fn remove_db() {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path()));
+    }
+}
+
 async fn db_thread() {
-    let io = Arc::new(MemoryIO::new());
+    let io = Arc::new(UringIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
-    let db = Database::open(io.clone(), "serve.db", options).unwrap();
+    let db = Database::open(io.clone(), &db_path(), options).unwrap();
     let config = Config {
         readers: 2,
         max_rows: 100,
@@ -215,6 +227,7 @@ async fn transactions() {
 
 #[test]
 fn serve_requests_from_another_thread() {
+    remove_db();
     thread_per_core(|ctx| {
         Box::pin(async move {
             if ctx.num_threads < 2 {
@@ -228,4 +241,5 @@ fn serve_requests_from_another_thread() {
             }
         })
     });
+    remove_db();
 }

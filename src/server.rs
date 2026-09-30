@@ -335,12 +335,14 @@ impl Slot {
             return;
         }
         self.wait = Wait::Ready;
-        if let (Some(err), Some(msg)) = (err, self.running.take()) {
-            // SAFETY: rule 2 — ours until we reply.
-            self.conn
-                .abort(unsafe { msg.payload.request_mut() }, err.clone());
-            self.finish(msg);
-        }
+        let Some(err) = err else {
+            return;
+        };
+        let msg = self.running.take().expect("a request waits on IO");
+        // SAFETY: rule 2 — ours until we reply.
+        self.conn
+            .abort(unsafe { msg.payload.request_mut() }, err.clone());
+        self.finish(msg);
     }
 }
 
