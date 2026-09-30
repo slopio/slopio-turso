@@ -3,8 +3,11 @@
 //! loop. Prints throughput and latency for reads and writes.
 //!
 //! ```text
-//! cargo run --release --example load -- [--seconds 10] [--tasks 4] [--reads 90] [--rows 100000] [--readers 2]
+//! cargo run --release --example load -- [--seconds 10] [--tasks 4] [--reads 90] [--rows 100000] [--readers 2] [--work-us 0]
 //! ```
+//!
+//! `--work-us` is CPU work each task does after every reply, standing in for
+//! handling it, so client threads are not only ever waiting on the database.
 //!
 //! `--reads` is the share of reads in percent: point lookups by random id. The
 //! rest are single-row inserts, each its own transaction, so each pays a commit.
@@ -31,6 +34,7 @@ struct Args {
     reads: u64,
     rows: i64,
     readers: u16,
+    work_us: u64,
 }
 
 impl Args {
@@ -41,6 +45,7 @@ impl Args {
             reads: 90,
             rows: 100_000,
             readers: 2,
+            work_us: 0,
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         for pair in raw.chunks(2) {
@@ -53,6 +58,7 @@ impl Args {
                 "--reads" => args.reads = parse(flag, value),
                 "--rows" => args.rows = parse(flag, value),
                 "--readers" => args.readers = parse(flag, value),
+                "--work-us" => args.work_us = parse(flag, value),
                 _ => panic!("unknown flag {flag}"),
             }
         }
@@ -199,6 +205,12 @@ async fn client_thread(args: Args, thread: usize, stats: Arc<Mutex<Stats>>) {
                     if matches!(done.result(), ResultSet::Error(_)) {
                         samples.errors += 1;
                     }
+                    drop(local);
+                    // Handle the reply: busy, as real work would keep the thread.
+                    let work = Instant::now() + Duration::from_micros(args.work_us);
+                    while Instant::now() < work {
+                        std::hint::spin_loop();
+                    }
                 }
             })
         })
@@ -235,8 +247,8 @@ fn main() {
 
     let mut stats = stats.lock().unwrap();
     println!(
-        "{} s, {} readers, {} tasks on each client thread, {}% reads",
-        args.seconds, args.readers, args.tasks, args.reads
+        "{} s, {} readers, {} tasks on each client thread, {}% reads, {}µs of work per reply",
+        args.seconds, args.readers, args.tasks, args.reads, args.work_us
     );
     stats.reads.report("reads", elapsed);
     stats.writes.report("writes", elapsed);
