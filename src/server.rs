@@ -5,7 +5,8 @@
 //! A `BEGIN` pins its connection to an interactive transaction until turso says
 //! it is over: `BEGIN` (read-only to turso) opens a read transaction on a
 //! reader, `BEGIN IMMEDIATE` a write transaction on the writer. Readers are
-//! query-only, so a write inside a read transaction fails.
+//! query-only, so a write inside a read transaction fails. A transaction left
+//! idle past [`Config::transaction_timeout`] is rolled back by the DB thread.
 //!
 //! This is the other half of the handoff protocol in [`crate::pending`].
 
@@ -15,7 +16,7 @@ use std::iter;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use slopio::io_driver::Message;
 use slopio::runtime::select::{SelectResult, select};
@@ -25,13 +26,36 @@ use turso_core::{Database, IO, LimboError};
 
 use crate::conn::{Conn, Step};
 use crate::pending::Pending;
-use crate::request::Error;
+use crate::request::{Error, Request};
 use crate::transaction::TransactionId;
 
 type Msg = Arc<Message<Pending>>;
 
 /// Steps a connection takes in a row before the others get their turn.
 const STEPS_PER_TURN: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Reader connections, on top of the single writer.
+    pub readers: u16,
+    /// A result past this many rows fails with `TooManyRows`.
+    pub max_rows: usize,
+    /// An interactive transaction with no request for this long is rolled back,
+    /// freeing its connection; its next request fails with `TransactionEnded`.
+    /// Callers are threads of this process, so a transaction idle this long is
+    /// a bug (a forgotten token, a stuck task), not a slow user.
+    pub transaction_timeout: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            readers: 2,
+            max_rows: 10_000,
+            transaction_timeout: Duration::from_secs(5),
+        }
+    }
+}
 
 pub struct Server {
     /// Writes run one at a time: turso takes one writer, and a second one
@@ -40,23 +64,24 @@ pub struct Server {
     readers: Vec<Slot>,
     writes: VecDeque<Msg>,
     reads: VecDeque<Msg>,
+    transaction_timeout: Duration,
 }
 
 impl Server {
-    pub fn new(db: &Arc<Database>, readers: usize, max_rows: usize) -> Result<Self, LimboError> {
+    pub fn new(db: &Arc<Database>, config: &Config) -> Result<Self, LimboError> {
         let slot = |index: u16, query_only: bool| {
             let conn = db.connect()?;
             conn.set_query_only(query_only);
-            Ok::<_, LimboError>(Slot::new(index, Conn::new(conn, max_rows)))
+            Ok::<_, LimboError>(Slot::new(index, Conn::new(conn, config.max_rows)))
         };
-        let readers = u16::try_from(readers).expect("fewer than 65535 readers");
         Ok(Server {
             writer: slot(0, false)?,
-            readers: (1..=readers)
+            readers: (1..=config.readers)
                 .map(|index| slot(index, true))
                 .collect::<Result<_, _>>()?,
             writes: VecDeque::new(),
             reads: VecDeque::new(),
+            transaction_timeout: config.transaction_timeout,
         })
     }
 
@@ -66,17 +91,13 @@ impl Server {
     /// still blocks the thread (turso's backends wait inside `IO::step`).
     pub async fn serve(mut self, io: Arc<dyn IO>) {
         loop {
-            if self.is_idle() {
-                // Nothing to do: sleep until a request arrives.
-                let msg = recv().await;
-                self.accept(msg);
-            }
             // Let the runtime process its completions, so requests sent since
             // the last turn reach the inbox, then take them all.
             yield_now().await;
             while let Some(msg) = try_recv().await {
                 self.accept(msg);
             }
+            self.expire_transactions(Instant::now());
             self.dispatch();
             let now = Instant::now();
             for slot in self.slots_mut() {
@@ -114,7 +135,16 @@ impl Server {
         }
     }
 
-    /// When no request can step right now, waits for what unblocks one.
+    /// Rolls back transactions idle past the timeout, freeing their connection.
+    fn expire_transactions(&mut self, now: Instant) {
+        let timeout = self.transaction_timeout;
+        for slot in self.slots_mut() {
+            slot.expire(now, timeout);
+        }
+    }
+
+    /// When no request can step right now, waits for what unblocks one: the
+    /// disk, a new request, or a deadline.
     async fn wait(&mut self, io: &dyn IO) {
         if self.slots_mut().any(|slot| slot.wait == Wait::Io) {
             let result = io.step();
@@ -123,26 +153,20 @@ impl Server {
             }
             return;
         }
+        // Connections freed this turn take their next request first.
+        self.dispatch();
         let now = Instant::now();
         if self.slots_mut().any(|slot| slot.is_runnable(now)) {
             return;
         }
-        let deadline = self.slots_mut().filter_map(|slot| slot.deadline()).min();
-        if let Some(deadline) = deadline {
-            // A new request may arrive before the busy database frees up.
-            let sleep = Sleep::during(deadline.saturating_duration_since(now));
-            if let SelectResult::First(msg) = select(recv(), sleep).await {
-                self.accept(msg);
-            }
+        let timeout = self.transaction_timeout;
+        let deadline = self
+            .slots_mut()
+            .filter_map(|slot| slot.deadline(timeout))
+            .min();
+        if let Some(msg) = recv_until(deadline).await {
+            self.accept(msg);
         }
-    }
-
-    fn is_idle(&self) -> bool {
-        self.writes.is_empty()
-            && self.reads.is_empty()
-            && iter::once(&self.writer)
-                .chain(&self.readers)
-                .all(|slot| slot.running.is_none() && slot.transaction_queue.is_empty())
     }
 
     fn slot_mut(&mut self, index: u16) -> Option<&mut Slot> {
@@ -179,6 +203,8 @@ struct Slot {
     transaction_queue: VecDeque<Msg>,
     /// Counter field of the next transaction id minted here.
     next_transaction: u32,
+    /// Since when the transaction has had no request running or queued.
+    idle_since: Option<Instant>,
 }
 
 impl Slot {
@@ -191,6 +217,7 @@ impl Slot {
             transaction: None,
             transaction_queue: VecDeque::new(),
             next_transaction: 0,
+            idle_since: None,
         }
     }
 
@@ -209,6 +236,7 @@ impl Slot {
                 reply(msg);
                 continue;
             }
+            self.idle_since = None;
             // SAFETY: rule 2 — ours until we reply.
             let request = unsafe { msg.payload.request_mut() };
             match self.conn.start(request) {
@@ -230,11 +258,31 @@ impl Slot {
             }
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    /// When this connection needs attention without a new request: a busy
+    /// database to retry, or an idle transaction to roll back.
+    fn deadline(&self, transaction_timeout: Duration) -> Option<Instant> {
         match (&self.running, self.wait) {
             (Some(_), Wait::Until(deadline)) => Some(deadline),
-            _ => None,
+            (Some(_), _) => None,
+            (None, _) => self.idle_since.map(|since| since + transaction_timeout),
         }
+    }
+
+    /// Queues a `ROLLBACK` for a transaction idle past `timeout`. It runs like
+    /// any request of the transaction, so ending it unpins the connection and
+    /// refuses whatever the caller sends meanwhile.
+    fn expire(&mut self, now: Instant, timeout: Duration) {
+        let Some(since) = self.idle_since else {
+            return;
+        };
+        if !self.transaction_queue.is_empty() || now < since + timeout {
+            return;
+        }
+        self.idle_since = None;
+        // Nobody awaits this one: its header reserves no slot, so `reply` wakes
+        // no one.
+        let rollback = Message::new(Pending::new(Request::rollback()));
+        self.transaction_queue.push_back(rollback);
     }
 
     /// Steps the running request until it waits, finishes, or its turn ends.
@@ -277,6 +325,7 @@ impl Slot {
             }
             _ => {}
         }
+        self.idle_since = self.transaction.map(|_| Instant::now());
         reply(msg);
     }
 
@@ -299,6 +348,18 @@ async fn recv() -> Msg {
     // SAFETY: the DB thread only ever receives `Message<Pending>` — the
     // requests `Client`s send it.
     unsafe { recv_msg_from_peer::<Pending>() }.await
+}
+
+/// The next request, or `None` once `deadline` has passed.
+async fn recv_until(deadline: Option<Instant>) -> Option<Msg> {
+    let Some(deadline) = deadline else {
+        return Some(recv().await);
+    };
+    let sleep = Sleep::during(deadline.saturating_duration_since(Instant::now()));
+    match select(recv(), sleep).await {
+        SelectResult::First(msg) => Some(msg),
+        SelectResult::Second(()) => None,
+    }
 }
 
 /// The next request if one is already in the inbox, without waiting.

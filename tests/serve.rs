@@ -14,18 +14,25 @@ use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::thread_per_core;
 use slopio_turso::client::Client;
 use slopio_turso::request::{Error, Request, ResultSet};
-use slopio_turso::server::Server;
+use slopio_turso::server::{Config, Server};
 use turso_core::{Database, MemoryIO, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const CLIENT_THREAD: usize = 1;
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Short, so the expiry test is quick; the other transactions never idle this long.
+const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(200);
 
 async fn db_thread() {
     let io = Arc::new(MemoryIO::new());
     let options = OpenOptions::new(Arc::new(SqliteDialect));
     let db = Database::open(io.clone(), "serve.db", options).unwrap();
-    let serving = Server::new(&db, 2, 100).unwrap().serve(io);
+    let config = Config {
+        readers: 2,
+        max_rows: 100,
+        transaction_timeout: TRANSACTION_TIMEOUT,
+    };
+    let serving = Server::new(&db, &config).unwrap().serve(io);
     match select(serving, select(recv_from_peer(), Sleep::during(TIMEOUT))).await {
         SelectResult::First(()) => unreachable!("serve never returns"),
         SelectResult::Second(SelectResult::First(_stop)) => {}
@@ -188,6 +195,22 @@ async fn transactions() {
         ResultSet::Error(Error::TransactionEnded)
     ));
     assert_eq!(count().await, before + 2);
+
+    // Idle past the timeout: the DB thread rolls it back and frees the writer.
+    let tx = client.begin_write().await.unwrap();
+    let (tx, _) = client.query_in(tx, insert("jo")).await;
+    Sleep::during(TRANSACTION_TIMEOUT * 3).await;
+    let (_tx, done) = client.query_in(tx, insert("kim")).await;
+    assert!(matches!(
+        done.result(),
+        ResultSet::Error(Error::TransactionEnded)
+    ));
+    let done = client.query(insert("lu")).await;
+    assert!(matches!(
+        done.result(),
+        ResultSet::Command { changes: 1, .. }
+    ));
+    assert_eq!(count().await, before + 3, "jo rolled back, lu inserted");
 }
 
 #[test]
