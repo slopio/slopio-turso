@@ -22,6 +22,9 @@ use crate::request::Request;
 /// table. The `counter` need only be distinct within one connection: it is what
 /// tells a live transaction from a finished one that ran on the same connection.
 /// The top bits are free for a thread id, should there be several DB threads.
+///
+/// Only the DB thread mints ids: outside this crate there is no way to build
+/// one, so a caller can only name a transaction whose token it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId(u64);
 
@@ -30,13 +33,13 @@ const COUNTER_MASK: u64 = 0xFFFF_FFFF;
 const FIELD16_MASK: u64 = 0xFFFF;
 
 impl TransactionId {
-    #[inline]
-    pub const fn new(raw: u64) -> Self {
+    #[cfg(test)]
+    const fn new(raw: u64) -> Self {
         TransactionId(raw)
     }
 
     #[inline]
-    pub const fn compose(connection: u16, counter: u32) -> Self {
+    pub(crate) const fn compose(connection: u16, counter: u32) -> Self {
         TransactionId(((connection as u64) << CONNECTION_SHIFT) | (counter as u64))
     }
 
