@@ -10,8 +10,9 @@
 //!
 //! The writer batches: writes queued together run in one transaction, each
 //! under its own savepoint so a failing one leaves the others alone, and share
-//! a single `COMMIT` — one fsync. A write is only answered once that commit
-//! succeeded; a failed one is answered at once.
+//! a single `COMMIT` — one fsync. That `COMMIT` runs like any request, so
+//! readers keep going while its fsync is in flight. A write is only answered
+//! once the commit succeeded; a failed one is answered at once.
 //!
 //! This is the other half of the handoff protocol in [`crate::pending`].
 
@@ -214,6 +215,14 @@ enum Wait {
     Until(Instant),
 }
 
+/// Writes sharing one transaction on the writer.
+enum Batch {
+    /// Writes that succeeded in it; more can join.
+    Open(Vec<Msg>),
+    /// Its `COMMIT` is running; these writes are answered once it ends.
+    Committing(Vec<Msg>),
+}
+
 /// Set by turso once the operation a request waits on has finished.
 struct IoDone(AtomicBool);
 
@@ -248,8 +257,8 @@ struct Slot {
     idle_since: Option<Instant>,
     /// Whether writes queued together share a transaction: the writer only.
     batches: bool,
-    /// The open batch: writes that succeeded in it, answered once it commits.
-    batch: Option<Vec<Msg>>,
+    /// The writes of the current batch, if one is open or committing.
+    batch: Option<Batch>,
 }
 
 impl Slot {
@@ -275,6 +284,10 @@ impl Slot {
     /// transaction only takes that transaction's requests.
     fn fill(&mut self, queue: &mut VecDeque<Msg>) {
         while self.running.is_none() {
+            if matches!(&self.batch, Some(Batch::Open(held)) if held.len() >= MAX_BATCH) {
+                self.start_commit();
+                continue;
+            }
             let next = match self.transaction {
                 Some(_) => self.transaction_queue.pop_front(),
                 None => queue.pop_front(),
@@ -282,7 +295,7 @@ impl Slot {
             let Some(msg) = next else {
                 // Nothing more to add right now: make the batch durable. Writes
                 // arriving meanwhile queue up and form the next one.
-                self.commit_batch();
+                self.start_commit();
                 return;
             };
             if msg.payload.is_cancelled() {
@@ -290,23 +303,35 @@ impl Slot {
                 continue;
             }
             self.idle_since = None;
-            // SAFETY: rule 2 — ours until we reply.
-            let request = unsafe { msg.payload.request_mut() };
             if self.batches && self.transaction.is_none() {
-                if controls_transaction(request.sql()) {
-                    // It would end or nest inside the batch: run it on its own.
-                    self.commit_batch();
+                // SAFETY: rule 2 — ours until we reply.
+                let sql = unsafe { msg.payload.request() }.sql();
+                if controls_transaction(sql) {
+                    // It would end or nest inside the batch: commit the batch
+                    // first, then run it on its own.
+                    if matches!(self.batch, Some(Batch::Open(_))) {
+                        queue.push_front(msg);
+                        self.start_commit();
+                        continue;
+                    }
                 } else if let Err(err) = self.enter_batch() {
                     fail(msg, Error::Turso(err));
                     continue;
                 }
             }
-            match self.conn.start(request) {
-                Step::Done => self.finish(msg),
-                _ => {
-                    self.running = Some(msg);
-                    self.wait = Wait::Ready;
-                }
+            self.start(msg);
+        }
+    }
+
+    /// Makes `msg` the running request, or finishes it if it could not start.
+    fn start(&mut self, msg: Msg) {
+        // SAFETY: rule 2 — ours until we reply.
+        let request = unsafe { msg.payload.request_mut() };
+        match self.conn.start(request) {
+            Step::Done => self.finish(msg),
+            _ => {
+                self.running = Some(msg);
+                self.wait = Wait::Ready;
             }
         }
     }
@@ -378,16 +403,9 @@ impl Slot {
 
     /// Opens the batch if none is, then a savepoint for the next write in it.
     fn enter_batch(&mut self) -> Result<(), LimboError> {
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|held| held.len() >= MAX_BATCH)
-        {
-            self.commit_batch();
-        }
         if self.batch.is_none() {
             self.conn.run_internal("BEGIN IMMEDIATE")?;
-            self.batch = Some(Vec::new());
+            self.batch = Some(Batch::Open(Vec::new()));
         }
         self.conn.run_internal("SAVEPOINT batch")
     }
@@ -406,46 +424,68 @@ impl Slot {
             Ok(())
         };
         let released = undone.and_then(|()| self.conn.run_internal("RELEASE batch"));
+        let Some(Batch::Open(held)) = &mut self.batch else {
+            unreachable!("a write ran in an open batch");
+        };
         match (released, failed) {
             (Ok(()), true) => reply(msg),
-            (Ok(()), false) => self.batch.as_mut().unwrap().push(msg),
+            (Ok(()), false) => held.push(msg),
             // The batch's state is unknown: give it up, this write with it.
             (Err(err), _) => {
-                self.batch.as_mut().unwrap().push(msg);
-                self.abort_batch(err);
+                held.push(msg);
+                self.abort_batch(Error::Turso(err));
             }
         }
     }
 
-    /// Makes the batch durable with one `COMMIT`, then answers every write in
-    /// it.
-    fn commit_batch(&mut self) {
-        if self.batch.is_none() {
+    /// Starts the batch's `COMMIT` as the running request, like any other: the
+    /// thread keeps serving the readers while its fsync is in flight.
+    fn start_commit(&mut self) {
+        let Some(Batch::Open(held)) = self.batch.take_if(|b| matches!(b, Batch::Open(_))) else {
             return;
-        }
-        match self.conn.run_internal("COMMIT") {
-            Ok(()) => self.batch.take().unwrap().into_iter().for_each(reply),
-            Err(err) => self.abort_batch(err),
+        };
+        self.batch = Some(Batch::Committing(held));
+        // Our own: its header reserves no slot, so `reply` wakes no one.
+        self.start(Message::new(Pending::new(Request::commit())));
+    }
+
+    /// The batch's `COMMIT` ended: answer every write in it, or fail them all
+    /// if it failed, since none of them is durable then.
+    fn end_commit(&mut self, commit: Msg, held: Vec<Msg>) {
+        // SAFETY: our own message, shared with no one.
+        match unsafe { commit.payload.request() }.result() {
+            ResultSet::Error(err) => {
+                self.batch = Some(Batch::Committing(held));
+                self.abort_batch(err.clone());
+            }
+            _ => held.into_iter().for_each(reply),
         }
     }
 
-    /// Rolls the batch back and fails every write in it with `err`: none of
-    /// them is durable.
-    fn abort_batch(&mut self, err: LimboError) {
+    /// Rolls the batch back and fails every write in it with `err`.
+    fn abort_batch(&mut self, err: Error) {
         let _ = self.conn.run_internal("ROLLBACK");
-        for msg in self.batch.take().unwrap_or_default() {
-            fail(msg, Error::Turso(err.clone()));
+        let held = match self.batch.take() {
+            Some(Batch::Open(held) | Batch::Committing(held)) => held,
+            None => Vec::new(),
+        };
+        for msg in held {
+            fail(msg, err.clone());
         }
     }
 
     /// Replies, after pinning the connection if the request opened a
     /// transaction, or unpinning it if the request ended one.
     fn finish(&mut self, msg: Msg) {
-        if self.batch.is_some() {
-            // Our own `BEGIN` holds the connection in a transaction: not the
-            // caller's to pin.
-            self.leave_batch(msg);
-            return;
+        // Our own `BEGIN` holds the connection in a transaction: not the
+        // caller's to pin.
+        match self.batch.take() {
+            Some(Batch::Committing(held)) => return self.end_commit(msg, held),
+            Some(open) => {
+                self.batch = Some(open);
+                return self.leave_batch(msg);
+            }
+            None => {}
         }
         match (self.transaction, self.conn.in_transaction()) {
             (None, true) => {
