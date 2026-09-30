@@ -79,7 +79,7 @@ impl IO for RingIo {
         }
         let file = options.open(path).map_err(|e| io_error(e, "open"))?;
         let file = Arc::new(RingFile {
-            file,
+            file: Arc::new(file),
             ring: Arc::clone(&self.ring),
         });
         if !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock) {
@@ -126,6 +126,9 @@ struct State {
 
 struct Op {
     completion: Completion,
+    /// The file it targets, kept open until it is done: were its fd closed
+    /// first, the number could be reused and the operation hit another file.
+    _file: Arc<std::fs::File>,
     /// What the kernel reads from or writes into, alive until it is done.
     _buffer: Option<Arc<Buffer>>,
     /// Set for a vectored write, resumed from where the kernel stopped.
@@ -214,6 +217,35 @@ impl Ring {
     }
 }
 
+impl Drop for State {
+    /// The kernel may still read or write the buffers `ops` keeps alive, even
+    /// once the ring is closed: wait for every operation to finish before
+    /// they are freed. Their completions are dropped unrun — turso is being
+    /// torn down.
+    fn drop(&mut self) {
+        while self.in_flight > 0 {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == ErrorKind::Interrupted
+                        || e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(_) => {
+                    // No way to wait: leak the buffers rather than free memory
+                    // the kernel may still write into.
+                    std::mem::forget(std::mem::take(&mut self.ops));
+                    return;
+                }
+            }
+            let finished: Vec<u64> = self.ring.completion().map(|cqe| cqe.user_data()).collect();
+            for key in finished {
+                if self.ops[key as usize].take().is_some() {
+                    self.in_flight -= 1;
+                }
+            }
+        }
+    }
+}
+
 impl State {
     fn push(&mut self, entry: squeue::Entry, op: Op) -> turso_core::Result<()> {
         let key = self.free.pop().unwrap_or_else(|| {
@@ -289,7 +321,7 @@ fn io_error(err: std::io::Error, op: &'static str) -> LimboError {
 }
 
 pub struct RingFile {
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     ring: Arc<Ring>,
 }
 
@@ -306,6 +338,7 @@ impl RingFile {
     ) -> turso_core::Result<Completion> {
         let op = Op {
             completion: c.clone(),
+            _file: Arc::clone(&self.file),
             _buffer: buffer,
             writev: None,
         };
@@ -385,6 +418,7 @@ impl File for RingFile {
         let entry = writev.entry();
         let op = Op {
             completion: c.clone(),
+            _file: Arc::clone(&self.file),
             _buffer: None,
             writev: Some(writev),
         };
@@ -436,6 +470,27 @@ mod tests {
 
     fn query(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<Vec<Value>> {
         conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    }
+
+    /// Dropping the IO with operations in flight waits for them: a write still
+    /// queued when the last handle goes away reaches the file.
+    #[test]
+    fn dropping_waits_for_operations_in_flight() {
+        let path = path("drop_in_flight");
+        remove(&path);
+        let io = RingIo::new().unwrap();
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
+        let data = vec![7u8; 1 << 20];
+        let buffer = Arc::new(Buffer::new(data.clone()));
+        drop(
+            file.pwrite(0, buffer, Completion::new_write(|_| {}))
+                .unwrap(),
+        );
+        // Never polled: the write is still queued or in flight.
+        drop(file);
+        drop(io);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        remove(&path);
     }
 
     /// Everything turso does to a database through the ring: WAL appends
