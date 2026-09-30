@@ -39,6 +39,7 @@ use crate::conn::{Conn, Step};
 use crate::io::RingIo;
 use crate::pending::Pending;
 use crate::request::{Error, Request, ResultSet};
+use crate::statement::Statement;
 use crate::transaction::TransactionId;
 
 type Msg = Arc<Message<Pending>>;
@@ -48,6 +49,12 @@ const STEPS_PER_TURN: usize = 64;
 
 /// Writes one batch holds at most before it commits.
 const MAX_BATCH: usize = 256;
+
+static BEGIN_BATCH: Statement = Statement::new("BEGIN IMMEDIATE");
+static SAVEPOINT: Statement = Statement::new("SAVEPOINT batch");
+static RELEASE: Statement = Statement::new("RELEASE batch");
+static ROLLBACK_TO: Statement = Statement::new("ROLLBACK TO batch");
+static ROLLBACK: Statement = Statement::new("ROLLBACK");
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -305,8 +312,8 @@ impl Slot {
             self.idle_since = None;
             if self.batches && self.transaction.is_none() {
                 // SAFETY: rule 2 — ours until we reply.
-                let sql = unsafe { msg.payload.request() }.sql();
-                if controls_transaction(sql) {
+                let statement = unsafe { msg.payload.request() }.statement();
+                if statement.controls_transaction() {
                     // It would end or nest inside the batch: commit the batch
                     // first, then run it on its own.
                     if matches!(self.batch, Some(Batch::Open(_))) {
@@ -404,10 +411,10 @@ impl Slot {
     /// Opens the batch if none is, then a savepoint for the next write in it.
     fn enter_batch(&mut self) -> Result<(), LimboError> {
         if self.batch.is_none() {
-            self.conn.run_internal("BEGIN IMMEDIATE")?;
+            self.conn.run_internal(&BEGIN_BATCH)?;
             self.batch = Some(Batch::Open(Vec::new()));
         }
-        self.conn.run_internal("SAVEPOINT batch")
+        self.conn.run_internal(&SAVEPOINT)
     }
 
     /// Settles a write that ran in the batch: a failed one is undone and
@@ -419,11 +426,11 @@ impl Slot {
             ResultSet::Error(_)
         );
         let undone = if failed {
-            self.conn.run_internal("ROLLBACK TO batch")
+            self.conn.run_internal(&ROLLBACK_TO)
         } else {
             Ok(())
         };
-        let released = undone.and_then(|()| self.conn.run_internal("RELEASE batch"));
+        let released = undone.and_then(|()| self.conn.run_internal(&RELEASE));
         let Some(Batch::Open(held)) = &mut self.batch else {
             unreachable!("a write ran in an open batch");
         };
@@ -464,7 +471,7 @@ impl Slot {
 
     /// Rolls the batch back and fails every write in it with `err`.
     fn abort_batch(&mut self, err: Error) {
-        let _ = self.conn.run_internal("ROLLBACK");
+        let _ = self.conn.run_internal(&ROLLBACK);
         let held = match self.batch.take() {
             Some(Batch::Open(held) | Batch::Committing(held)) => held,
             None => Vec::new(),
@@ -519,19 +526,6 @@ impl Slot {
             .abort(unsafe { msg.payload.request_mut() }, err.clone());
         self.finish(msg);
     }
-}
-
-/// Whether `sql` starts or ends a transaction or savepoint: inside a batch it
-/// would commit, nest in or undo the batch's own.
-fn controls_transaction(sql: &str) -> bool {
-    let keyword = sql
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .next()
-        .unwrap_or("");
-    ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"]
-        .iter()
-        .any(|k| keyword.eq_ignore_ascii_case(k))
 }
 
 async fn recv() -> Msg {
@@ -622,32 +616,4 @@ fn reply(msg: Msg) {
     let header = msg.header;
     drop(msg);
     signal_reply_to_peer(&header, 0);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::controls_transaction;
-
-    #[test]
-    fn transaction_control_is_recognised() {
-        for sql in [
-            "BEGIN",
-            "begin immediate",
-            "  COMMIT",
-            "END TRANSACTION",
-            "ROLLBACK TO s",
-            "SAVEPOINT s",
-            "RELEASE s",
-        ] {
-            assert!(controls_transaction(sql), "{sql}");
-        }
-        for sql in [
-            "INSERT INTO t VALUES (1)",
-            "UPDATE t SET x = 1",
-            "CREATE TABLE begin_log (x)",
-            "",
-        ] {
-            assert!(!controls_transaction(sql), "{sql}");
-        }
-    }
 }

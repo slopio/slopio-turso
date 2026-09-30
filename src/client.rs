@@ -45,7 +45,7 @@ impl Client {
     /// error it failed with. Rows are decoded here, on the caller's thread, as
     /// they are iterated.
     pub async fn query_typed<Q: Query>(&self, params: &[ValueRef<'_>]) -> Result<Rows<Q>, Error> {
-        Rows::new(self.query(Request::prepared(Q::NAME, Q::SQL, params)).await)
+        Rows::new(self.query(Request::prepared(Q::STATEMENT, params)).await)
     }
 
     /// Put `request` in flight and hand back the future awaiting its wakeup.

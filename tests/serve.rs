@@ -17,6 +17,7 @@ use slopio_turso::io::RingIo;
 use slopio_turso::query::{DecodeError, Query, get_str};
 use slopio_turso::request::{Error, Request, ResultSet};
 use slopio_turso::server::{Config, Server};
+use slopio_turso::statement::Statement;
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
@@ -37,13 +38,24 @@ fn remove_db() {
     }
 }
 
+static CREATE_USERS: Statement = Statement::new("CREATE TABLE users (name TEXT)");
+static INSERT_USER: Statement = Statement::new("INSERT INTO users VALUES (?1)");
+static MISSING: Statement = Statement::new("SELECT * FROM missing");
+static COUNT_FOREVER: Statement = Statement::new(
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c",
+);
+static NAMES: Statement = Statement::new("SELECT name FROM users ORDER BY name");
+static CREATE_TAGS: Statement = Statement::new("CREATE TABLE tags (name TEXT UNIQUE)");
+static INSERT_TAG: Statement = Statement::new("INSERT INTO tags VALUES (?1)");
+static COUNT_TAGS: Statement = Statement::new("SELECT count(*) FROM tags");
+static COUNT_USERS: Statement = Statement::new("SELECT count(*) FROM users");
+
 /// A typed query: rows are decoded on the client, borrowing the arena.
 struct Name<'a>(&'a str);
 
 impl Query for Name<'static> {
     type Row<'a> = Name<'a>;
-    const NAME: &'static str = "names";
-    const SQL: &'static str = "SELECT name FROM users ORDER BY name";
+    const STATEMENT: &'static Statement = &NAMES;
     fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Name<'a>, DecodeError> {
         Ok(Name(get_str(row, 0)?))
     }
@@ -79,18 +91,14 @@ async fn client_thread() {
 
 async fn queries() {
     let client = Client::new(DB_THREAD);
-    let run =
-        |name, sql, params: &[ValueRef<'_>]| client.query(Request::prepared(name, sql, params));
+    let run = |statement: &'static Statement, params: &[ValueRef<'_>]| {
+        client.query(Request::prepared(statement, params))
+    };
 
-    let done = run("create", "CREATE TABLE users (name TEXT)", &[]).await;
+    let done = run(&CREATE_USERS, &[]).await;
     assert!(matches!(done.result(), ResultSet::Command { .. }));
     for name in ["ada", "bob"] {
-        let done = run(
-            "insert",
-            "INSERT INTO users VALUES (?1)",
-            &[Value::from_text(name).as_ref()],
-        )
-        .await;
+        let done = run(&INSERT_USER, &[Value::from_text(name).as_ref()]).await;
         assert!(matches!(
             done.result(),
             ResultSet::Command { changes: 1, .. }
@@ -101,16 +109,12 @@ async fn queries() {
     let names: Vec<_> = names.iter().map(|name| name.unwrap().0).collect();
     assert_eq!(names, ["ada", "bob"]);
 
-    let done = run("missing", "SELECT * FROM missing", &[]).await;
+    let done = run(&MISSING, &[]).await;
     assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
 
     // Abandoning the future cancels the request on the DB thread, which still
     // signals and moves on to the next one.
-    let forever = run(
-        "forever",
-        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c",
-        &[],
-    );
+    let forever = run(&COUNT_FOREVER, &[]);
     match select(forever, Sleep::during(Duration::from_millis(50))).await {
         SelectResult::First(_) => panic!("the query should still be running"),
         SelectResult::Second(()) => {}
@@ -118,18 +122,10 @@ async fn queries() {
     // Several requests in flight at once: the writes queue for the writer,
     // the reads spread over the readers.
     let (a, b, c, d) = join4(
-        run(
-            "insert",
-            "INSERT INTO users VALUES (?1)",
-            &[Value::from_text("cy").as_ref()],
-        ),
-        run("names", "SELECT name FROM users ORDER BY name", &[]),
-        run(
-            "insert",
-            "INSERT INTO users VALUES (?1)",
-            &[Value::from_text("dee").as_ref()],
-        ),
-        run("names", "SELECT name FROM users ORDER BY name", &[]),
+        run(&INSERT_USER, &[Value::from_text("cy").as_ref()]),
+        run(&NAMES, &[]),
+        run(&INSERT_USER, &[Value::from_text("dee").as_ref()]),
+        run(&NAMES, &[]),
     )
     .await;
     for write in [a, c] {
@@ -144,9 +140,9 @@ async fn queries() {
 
     // Writes in flight together share a batch: a failing one leaves the others
     // alone, and each reports its own result.
-    run("create_tags", "CREATE TABLE tags (name TEXT UNIQUE)", &[]).await;
+    run(&CREATE_TAGS, &[]).await;
     let [x, y, z] = ["x", "y", "z"].map(Value::from_text);
-    let tag = |name: &Value| run("tag", "INSERT INTO tags VALUES (?1)", &[name.as_ref()]);
+    let tag = |name: &Value| run(&INSERT_TAG, &[name.as_ref()]);
     let (a, b, c, d) = join4(tag(&x), tag(&y), tag(&x), tag(&z)).await;
     let failed = [&a, &b, &c, &d].map(|done| matches!(done.result(), ResultSet::Error(_)));
     assert_eq!(
@@ -155,11 +151,11 @@ async fn queries() {
         "only the duplicate fails"
     );
     assert!(!failed[1] && !failed[3]);
-    let done = run("count_tags", "SELECT count(*) FROM tags", &[]).await;
+    let done = run(&COUNT_TAGS, &[]).await;
     let tags = done.rows_iter().next().unwrap()[0];
     assert!(matches!(tags, ValueRef::Numeric(Numeric::Integer(3))));
 
-    let done = run("count", "SELECT count(*) FROM users", &[]).await;
+    let done = run(&COUNT_USERS, &[]).await;
     let count = done.rows_iter().next().unwrap()[0];
     assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(4))));
 }
@@ -168,13 +164,7 @@ async fn queries() {
 async fn transactions() {
     let client = Client::new(DB_THREAD);
     let count = || async move {
-        let done = client
-            .query(Request::prepared(
-                "count",
-                "SELECT count(*) FROM users",
-                &[],
-            ))
-            .await;
+        let done = client.query(Request::prepared(&COUNT_USERS, &[])).await;
         match done.rows_iter().next().unwrap()[0] {
             ValueRef::Numeric(Numeric::Integer(n)) => n,
             other => panic!("not a count: {other:?}"),
@@ -182,7 +172,7 @@ async fn transactions() {
     };
     let insert = |name: &str| {
         let name = Value::from_text(name.to_owned());
-        Request::prepared("insert", "INSERT INTO users VALUES (?1)", &[name.as_ref()])
+        Request::prepared(&INSERT_USER, &[name.as_ref()])
     };
     let before = count().await;
 
@@ -199,9 +189,7 @@ async fn transactions() {
         ResultSet::Command { changes: 1, .. }
     ));
     // In turso a failed statement leaves the transaction open.
-    let (tx, done) = client
-        .query_in(tx, Request::prepared("bad", "SELECT * FROM missing", &[]))
-        .await;
+    let (tx, done) = client.query_in(tx, Request::prepared(&MISSING, &[])).await;
     assert!(matches!(done.result(), ResultSet::Error(_)));
     assert_eq!(count().await, before, "readers don't see uncommitted rows");
     client.commit(tx).await.unwrap();

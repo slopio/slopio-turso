@@ -15,11 +15,21 @@ use slopio_turso::io::RingIo;
 use slopio_turso::query::{DecodeError, Query, get_i64, get_opt_str, get_str};
 use slopio_turso::request::{Request, ResultSet};
 use slopio_turso::server::{Config, Server};
+use slopio_turso::statement::Statement;
 use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
 const APP_THREAD: usize = 1;
 const PATH: &str = "/tmp/slopio-turso-users.db";
+
+// Every statement is a `static`: its address is its identity, the key of each
+// connection's statement cache, so it is prepared once per connection.
+static CREATE_USERS: Statement =
+    Statement::new("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)");
+static INSERT_USER: Statement = Statement::new("INSERT INTO users (name, email) VALUES (?1, ?2)");
+static USERS_BY_NAME: Statement = Statement::new("SELECT id, name, email FROM users ORDER BY name");
+static COUNT_USERS_LIKE: Statement =
+    Statement::new("SELECT count(*) FROM users WHERE name LIKE ?1");
 
 /// One row of the `users` table. `&str` fields borrow the result's arena: no
 /// copy, but the row cannot outlive the `Rows` it came from.
@@ -29,12 +39,10 @@ struct User<'a> {
     email: Option<&'a str>,
 }
 
-/// The query *is* the row type: its name keys the statement cache, so each
-/// connection prepares it once.
+/// The query *is* the row type, tied to its statement.
 impl Query for User<'static> {
     type Row<'a> = User<'a>;
-    const NAME: &'static str = "users_by_name";
-    const SQL: &'static str = "SELECT id, name, email FROM users ORDER BY name";
+    const STATEMENT: &'static Statement = &USERS_BY_NAME;
     fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<User<'a>, DecodeError> {
         Ok(User {
             id: get_i64(row, 0)?,
@@ -49,8 +57,7 @@ struct Count(i64);
 
 impl Query for Count {
     type Row<'a> = Count;
-    const NAME: &'static str = "count_users_like";
-    const SQL: &'static str = "SELECT count(*) FROM users WHERE name LIKE ?1";
+    const STATEMENT: &'static Statement = &COUNT_USERS_LIKE;
     fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Count, DecodeError> {
         Ok(Count(get_i64(row, 0)?))
     }
@@ -60,22 +67,13 @@ impl Query for Count {
 fn insert(name: &str, email: Option<&str>) -> Request {
     let name = Value::from_text(name.to_owned());
     let email = email.map_or(Value::Null, |e| Value::from_text(e.to_owned()));
-    Request::prepared(
-        "insert_user",
-        "INSERT INTO users (name, email) VALUES (?1, ?2)",
-        &[name.as_ref(), email.as_ref()],
-    )
+    Request::prepared(&INSERT_USER, &[name.as_ref(), email.as_ref()])
 }
 
 async fn app() {
     let client = Client::new(DB_THREAD);
 
-    let create = Request::prepared(
-        "create_users",
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)",
-        &[],
-    );
-    client.query(create).await;
+    client.query(Request::prepared(&CREATE_USERS, &[])).await;
 
     for (name, email) in [("ada", Some("ada@example.com")), ("bob", None)] {
         let done = client.query(insert(name, email)).await;

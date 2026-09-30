@@ -5,4 +5,5 @@ mod pending;
 pub mod query;
 pub mod request;
 pub mod server;
+pub mod statement;
 pub mod transaction;

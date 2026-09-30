@@ -23,9 +23,13 @@ use slopio_turso::client::Client;
 use slopio_turso::io::RingIo;
 use slopio_turso::request::{Request, ResultSet};
 use slopio_turso::server::{Config, Server};
+use slopio_turso::statement::Statement;
 use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
+
+static GET_USER: Statement = Statement::new("SELECT id, name FROM users WHERE id = ?1");
+static INSERT_USER: Statement = Statement::new("INSERT INTO users (name) VALUES (?1)");
 const PATH: &str = "/tmp/slopio-turso-load.db";
 
 #[derive(Clone, Copy)]
@@ -178,21 +182,11 @@ async fn client_thread(args: Args, thread: usize, stats: Arc<Mutex<Stats>>) {
                     let done = if read {
                         let id = (rng.next() % args.rows as u64) as i64 + 1;
                         let params = [ValueRef::from_i64(id)];
-                        client
-                            .query(Request::prepared(
-                                "get",
-                                "SELECT id, name FROM users WHERE id = ?1",
-                                &params,
-                            ))
-                            .await
+                        client.query(Request::prepared(&GET_USER, &params)).await
                     } else {
                         let name = Value::from_text(format!("new{}", rng.next() % 1_000_000));
                         client
-                            .query(Request::prepared(
-                                "insert",
-                                "INSERT INTO users (name) VALUES (?1)",
-                                &[name.as_ref()],
-                            ))
+                            .query(Request::prepared(&INSERT_USER, &[name.as_ref()]))
                             .await
                     };
                     let elapsed = start.elapsed();

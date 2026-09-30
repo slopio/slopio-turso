@@ -1,6 +1,6 @@
 //! Typed query layer over the positional row API.
 //!
-//! Each query is a type implementing [`Query`]: a stable name, its SQL, and a
+//! Each query is a type implementing [`Query`]: its statement, and a
 //! concrete row type with a **non-panicking** mapping from the raw positional
 //! columns, built from the `get_*` helpers below. Decoding happens on the
 //! caller's thread, lazily as rows are iterated: the DB thread only fills the
@@ -16,15 +16,14 @@ use std::marker::PhantomData;
 use turso_core::{Numeric, ValueRef};
 
 use crate::request::{Error, Request, ResultSet};
+use crate::statement::Statement;
 
 /// A statically-declared query: its identity, SQL, and row type + mapping.
 pub trait Query {
     /// The concrete row type; borrows the arena (for `&str`/`&[u8]` fields).
     type Row<'a>;
-    /// Stable identity — the key of the per-connection statement cache.
-    const NAME: &'static str;
-    /// The SQL text, with `?1..` placeholders.
-    const SQL: &'static str;
+    /// Its statement, a `static`, with `?1..` placeholders.
+    const STATEMENT: &'static Statement;
     /// Map one row's positional columns into the row type. Never panics.
     fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Self::Row<'a>, DecodeError>;
 }
@@ -232,6 +231,8 @@ mod tests {
     use super::*;
     use turso_core::Value;
 
+    static USERS: Statement = Statement::new("SELECT id, name, email FROM users");
+
     /// The row type *is* the query: fields + a lifetime for the borrowed string.
     #[derive(Debug, PartialEq)]
     struct User<'a> {
@@ -244,8 +245,7 @@ mod tests {
     // the actual rows are `User<'shorter>` via the `Row<'a>` GAT.
     impl Query for User<'static> {
         type Row<'a> = User<'a>;
-        const NAME: &'static str = "users";
-        const SQL: &'static str = "SELECT id, name, email FROM users";
+        const STATEMENT: &'static Statement = &USERS;
         fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<User<'a>, DecodeError> {
             Ok(User {
                 id: get_i64(row, 0)?,
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn typed_rows_decode_positionally() {
-        let mut request = Request::prepared(User::NAME, User::SQL, &[]);
+        let mut request = Request::prepared(User::STATEMENT, &[]);
         request.begin_rows();
         let ada = [int(1), Value::from_text("ada"), Value::from_text("ada@x")];
         let bob = [int(2), Value::from_text("bob"), Value::Null];
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_failed_request_is_an_error() {
-        let mut request = Request::prepared(User::NAME, User::SQL, &[]);
+        let mut request = Request::prepared(User::STATEMENT, &[]);
         request.set_error(Error::TooManyRows);
         assert!(matches!(
             Rows::<User<'static>>::new(request),

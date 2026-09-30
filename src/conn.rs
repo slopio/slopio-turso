@@ -1,6 +1,6 @@
 //! One turso connection running [`Request`]s, one at a time.
 //!
-//! Statements are prepared on first use and cached by request name. A request
+//! Statements are prepared on first use and cached under their identity. A request
 //! runs step by step and never blocks: [`Conn::step`] says what to wait for
 //! before stepping again.
 
@@ -13,9 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::task::Waker;
 use std::time::Duration;
 
-use turso_core::{Connection, LimboError, Statement, StepResult};
+use turso_core::{Connection, LimboError, Statement as Prepared, StepResult};
 
 use crate::request::{Error, Request};
+use crate::statement::Statement;
 
 /// How many VM instructions run between two looks at the cancel flag.
 const CANCEL_CHECK_OPS: u64 = 1000;
@@ -35,11 +36,11 @@ pub(crate) enum Step {
 
 pub(crate) struct Conn {
     conn: Arc<Connection>,
-    statements: HashMap<&'static str, Statement>,
-    /// The DB thread's own statements, keyed by their SQL.
-    internal: HashMap<&'static str, Statement>,
-    /// Name of the statement in flight, if any.
-    running: Option<&'static str>,
+    /// Keyed by [`Statement::key`]: requests' statements and the DB thread's
+    /// own alike, which never share a key.
+    statements: HashMap<usize, Prepared>,
+    /// Key of the statement in flight, if any.
+    running: Option<usize>,
     /// The running request's cancel flag, set only for the duration of a step:
     /// turso's progress handler reads it from inside the step.
     cancel_flag: Arc<AtomicPtr<AtomicBool>>,
@@ -61,7 +62,6 @@ impl Conn {
         Conn {
             conn,
             statements: HashMap::new(),
-            internal: HashMap::new(),
             running: None,
             cancel_flag,
             max_rows,
@@ -82,7 +82,7 @@ impl Conn {
         debug_assert!(self.is_idle(), "one request at a time");
         match self.bind(request) {
             Ok(()) => {
-                self.running = Some(request.name());
+                self.running = Some(request.statement().key());
                 Step::Ready
             }
             Err(err) => {
@@ -97,18 +97,21 @@ impl Conn {
     /// Follows `sqlite3_stmt_readonly`, which counts `BEGIN` and `COMMIT` as
     /// read-only.
     pub(crate) fn is_readonly(&mut self, request: &Request) -> Result<bool, LimboError> {
-        Ok(self.prepared(request)?.get_program().is_readonly())
+        Ok(self
+            .prepared(request.statement())?
+            .get_program()
+            .is_readonly())
     }
 
-    fn prepared(&mut self, request: &Request) -> Result<&mut Statement, LimboError> {
-        Ok(match self.statements.entry(request.name()) {
+    fn prepared(&mut self, statement: &'static Statement) -> Result<&mut Prepared, LimboError> {
+        Ok(match self.statements.entry(statement.key()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(self.conn.prepare(request.sql())?),
+            Entry::Vacant(e) => e.insert(self.conn.prepare(statement.sql())?),
         })
     }
 
     fn bind(&mut self, request: &mut Request) -> Result<(), LimboError> {
-        let stmt = self.prepared(request)?;
+        let stmt = self.prepared(request.statement())?;
         // Parameters left over from a previous run would otherwise leak in.
         stmt.clear_bindings();
         for (index, param) in (1..).zip(request.params()) {
@@ -124,12 +127,9 @@ impl Conn {
     /// completion, prepared on first use. Blocks on its IO: all of them run in
     /// memory but `COMMIT`, whose fsync would block the thread inside
     /// `IO::step` anyway.
-    pub(crate) fn run_internal(&mut self, sql: &'static str) -> Result<(), LimboError> {
+    pub(crate) fn run_internal(&mut self, statement: &'static Statement) -> Result<(), LimboError> {
         debug_assert!(self.is_idle(), "no request may be running");
-        let stmt = match self.internal.entry(sql) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(self.conn.prepare(sql)?),
-        };
+        let stmt = self.prepared(statement)?;
         let ran = stmt.run_ignore_rows();
         let reset = stmt.reset();
         ran.and(reset)
@@ -137,9 +137,9 @@ impl Conn {
 
     /// Ends the running request with `err`, e.g. when the IO backend failed.
     pub(crate) fn abort(&mut self, request: &mut Request, err: LimboError) {
-        if let Some(name) = self.running.take() {
+        if let Some(key) = self.running.take() {
             // The statement may be mid-IO, so this can block; the IO is broken anyway.
-            let _ = self.statements.get_mut(name).map(Statement::reset);
+            let _ = self.statements.get_mut(&key).map(Prepared::reset);
         }
         request.set_error(Error::Turso(err));
     }
@@ -154,10 +154,10 @@ impl Conn {
         cancelled: &AtomicBool,
         waker: &Waker,
     ) -> Step {
-        let name = self.running.expect("a request is running");
+        let key = self.running.expect("a request is running");
         let stmt = self
             .statements
-            .get_mut(name)
+            .get_mut(&key)
             .expect("running statement is cached");
         self.cancel_flag
             .store(ptr::from_ref(cancelled).cast_mut(), Ordering::Relaxed);
@@ -217,13 +217,17 @@ mod tests {
         request
     }
 
-    fn exec(
-        conn: &mut Conn,
-        name: &'static str,
-        sql: &'static str,
-        params: &[ValueRef<'_>],
-    ) -> Request {
-        run(conn, Request::prepared(name, sql, params))
+    static CREATE_USERS: Statement =
+        Statement::new("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT UNIQUE)");
+    static INSERT_USER: Statement = Statement::new("INSERT INTO users (name) VALUES (?1)");
+    static USERS_BY_ID: Statement = Statement::new("SELECT id, name FROM users ORDER BY id");
+    static USER_NAMES: Statement = Statement::new("SELECT name FROM users");
+    static COUNT_USERS: Statement = Statement::new("SELECT count(*) FROM users");
+    static MISSING: Statement = Statement::new("SELECT * FROM missing");
+    static ONE: Statement = Statement::new("SELECT 1");
+
+    fn exec(conn: &mut Conn, statement: &'static Statement, params: &[ValueRef<'_>]) -> Request {
+        run(conn, Request::prepared(statement, params))
     }
 
     fn int(value: &ValueRef<'_>) -> i64 {
@@ -234,20 +238,10 @@ mod tests {
     }
 
     fn users(conn: &mut Conn) {
-        exec(
-            conn,
-            "create",
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT UNIQUE)",
-            &[],
-        );
+        exec(conn, &CREATE_USERS, &[]);
         for name in ["ada", "bob", "cy"] {
             let text = Value::from_text(name);
-            exec(
-                conn,
-                "insert",
-                "INSERT INTO users (name) VALUES (?1)",
-                &[text.as_ref()],
-            );
+            exec(conn, &INSERT_USER, &[text.as_ref()]);
         }
     }
 
@@ -256,12 +250,7 @@ mod tests {
         let mut conn = open("insert_then_select", 100);
         users(&mut conn);
 
-        let done = exec(
-            &mut conn,
-            "select",
-            "SELECT id, name FROM users ORDER BY id",
-            &[],
-        );
+        let done = exec(&mut conn, &USERS_BY_ID, &[]);
         let rows: Vec<_> = done
             .rows_iter()
             .map(|row| (int(&row[0]), row[1].to_text().unwrap().to_owned()))
@@ -276,12 +265,7 @@ mod tests {
     fn write_reports_changes_and_rowid() {
         let mut conn = open("write_reports_changes_and_rowid", 100);
         users(&mut conn);
-        let done = exec(
-            &mut conn,
-            "insert",
-            "INSERT INTO users (name) VALUES (?1)",
-            &[Value::from_text("dee").as_ref()],
-        );
+        let done = exec(&mut conn, &INSERT_USER, &[Value::from_text("dee").as_ref()]);
         assert!(matches!(
             done.result(),
             ResultSet::Command {
@@ -298,19 +282,14 @@ mod tests {
         let mut conn = open("errors_leave_the_connection_usable", 100);
         users(&mut conn);
 
-        let done = exec(&mut conn, "bad", "SELECT * FROM missing", &[]);
+        let done = exec(&mut conn, &MISSING, &[]);
         assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
 
         let dup = Value::from_text("ada");
-        let done = exec(
-            &mut conn,
-            "insert",
-            "INSERT INTO users (name) VALUES (?1)",
-            &[dup.as_ref()],
-        );
+        let done = exec(&mut conn, &INSERT_USER, &[dup.as_ref()]);
         assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
 
-        let done = exec(&mut conn, "count", "SELECT count(*) FROM users", &[]);
+        let done = exec(&mut conn, &COUNT_USERS, &[]);
         assert_eq!(int(&done.rows_iter().next().unwrap()[0]), 3);
     }
 
@@ -318,7 +297,7 @@ mod tests {
     fn row_limit() {
         let mut conn = open("row_limit", 2);
         users(&mut conn);
-        let done = exec(&mut conn, "all", "SELECT name FROM users", &[]);
+        let done = exec(&mut conn, &USER_NAMES, &[]);
         assert!(matches!(
             done.result(),
             ResultSet::Error(Error::TooManyRows)
@@ -329,11 +308,10 @@ mod tests {
     fn cancel_interrupts_a_long_step() {
         let mut conn = open("cancel_interrupts_a_long_step", 100);
         // One row, at the very end: the whole count runs inside a single step.
-        let mut request = Request::prepared(
-            "count",
+        static COUNT_FOREVER: Statement = Statement::new(
             "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c",
-            &[],
         );
+        let mut request = Request::prepared(&COUNT_FOREVER, &[]);
         conn.start(&mut request);
         let cancelled = AtomicBool::new(true);
         assert_eq!(
@@ -346,7 +324,7 @@ mod tests {
         ));
 
         // The interrupt does not leak into the next request.
-        let done = exec(&mut conn, "one", "SELECT 1", &[]);
+        let done = exec(&mut conn, &ONE, &[]);
         assert_eq!(int(&done.rows_iter().next().unwrap()[0]), 1);
     }
 }

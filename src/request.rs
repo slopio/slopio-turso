@@ -12,6 +12,7 @@ use self_cell::self_cell;
 use turso_core::types::TextRef;
 use turso_core::{LimboError, Value, ValueRef};
 
+use crate::statement::Statement;
 use crate::transaction::TransactionId;
 
 /// One row: its columns, each borrowing the arena. The spine lives in the
@@ -43,14 +44,12 @@ pub enum ResultSet<'a> {
     Error(Error),
 }
 
-/// `'a` is the lifetime of the owning [`Bump`]; `name`/`sql` are `'static` and
-/// never touch the arena.
+/// `'a` is the lifetime of the owning [`Bump`]; the statement is `'static` and
+/// never touches the arena.
 #[derive(Debug)]
 struct Body<'a> {
-    /// Key for the connection's statement cache.
-    name: &'static str,
-    /// Prepared on first use per connection.
-    sql: &'static str,
+    /// Prepared on first use per connection, cached under its identity.
+    statement: &'static Statement,
     params: BumpVec<'a, ValueRef<'a>>,
     /// `None` outside an interactive transaction.
     transaction: Option<TransactionId>,
@@ -82,15 +81,14 @@ unsafe impl Send for Request {}
 impl Request {
     /// Params are copied into a fresh arena; the result starts
     /// [`Building`](ResultSet::Building) and is filled by the transitions below.
-    pub fn prepared(name: &'static str, sql: &'static str, params: &[ValueRef<'_>]) -> Self {
+    pub fn prepared(statement: &'static Statement, params: &[ValueRef<'_>]) -> Self {
         Request::new(Bump::new(), |bump| {
             let mut bound = BumpVec::with_capacity_in(params.len(), bump);
             for param in params {
                 bound.push(copy_into(bump, *param));
             }
             Body {
-                name,
-                sql,
+                statement,
                 params: bound,
                 transaction: None,
                 result: ResultSet::Building,
@@ -101,29 +99,29 @@ impl Request {
     /// Opens a write transaction: turso classes it as a write, so it lands on
     /// the writer.
     pub fn begin_write() -> Self {
-        Request::prepared("__begin_write", "BEGIN IMMEDIATE", &[])
+        static BEGIN_WRITE: Statement = Statement::new("BEGIN IMMEDIATE");
+        Request::prepared(&BEGIN_WRITE, &[])
     }
 
     /// Opens a read transaction: turso classes it as read-only, so it lands on
     /// a reader.
     pub fn begin_read() -> Self {
-        Request::prepared("__begin_read", "BEGIN", &[])
+        static BEGIN_READ: Statement = Statement::new("BEGIN");
+        Request::prepared(&BEGIN_READ, &[])
     }
 
     pub fn commit() -> Self {
-        Request::prepared("__commit", "COMMIT", &[])
+        static COMMIT: Statement = Statement::new("COMMIT");
+        Request::prepared(&COMMIT, &[])
     }
 
     pub fn rollback() -> Self {
-        Request::prepared("__rollback", "ROLLBACK", &[])
+        static ROLLBACK: Statement = Statement::new("ROLLBACK");
+        Request::prepared(&ROLLBACK, &[])
     }
 
-    pub fn name(&self) -> &'static str {
-        self.borrow_dependent().name
-    }
-
-    pub fn sql(&self) -> &'static str {
-        self.borrow_dependent().sql
+    pub fn statement(&self) -> &'static Statement {
+        self.borrow_dependent().statement
     }
 
     pub fn params(&self) -> &[ValueRef<'_>] {
@@ -231,10 +229,10 @@ mod tests {
 
     #[test]
     fn params_are_copied_into_the_arena() {
+        static INSERT: Statement = Statement::new("INSERT INTO users (name, age) VALUES (?1, ?2)");
         let name = String::from("ada");
         let request = Request::prepared(
-            "insert_user",
-            "INSERT INTO users (name, age) VALUES (?1, ?2)",
+            &INSERT,
             &[
                 Value::from_text(name.clone()).as_ref(),
                 ValueRef::from_i64(36),
@@ -250,7 +248,8 @@ mod tests {
 
     #[test]
     fn rows_accumulate() {
-        let mut request = Request::prepared("users", "SELECT id, name FROM users", &[]);
+        static USERS: Statement = Statement::new("SELECT id, name FROM users");
+        let mut request = Request::prepared(&USERS, &[]);
         request.begin_rows();
         request.push_row([Value::Numeric(Numeric::Integer(1)), Value::from_text("ada")].iter());
         request.push_row([Value::Numeric(Numeric::Integer(2)), Value::Null].iter());
@@ -262,7 +261,8 @@ mod tests {
 
     #[test]
     fn empty_select_is_rows_not_command() {
-        let mut request = Request::prepared("none", "SELECT 1 WHERE 0", &[]);
+        static NONE: Statement = Statement::new("SELECT 1 WHERE 0");
+        let mut request = Request::prepared(&NONE, &[]);
         request.begin_rows();
         request.finish_command(0, 0);
         assert_eq!(request.row_count(), Some(0));
@@ -270,7 +270,8 @@ mod tests {
 
     #[test]
     fn transaction_rides_along() {
-        let request = Request::prepared("one", "SELECT 1", &[]);
+        static ONE: Statement = Statement::new("SELECT 1");
+        let request = Request::prepared(&ONE, &[]);
         assert_eq!(request.transaction(), None);
         let id = TransactionId::compose(1, 42);
         assert_eq!(request.in_transaction(id).transaction(), Some(id));
@@ -278,7 +279,8 @@ mod tests {
 
     #[test]
     fn write_is_a_command() {
-        let mut request = Request::prepared("del", "DELETE FROM users", &[]);
+        static DELETE: Statement = Statement::new("DELETE FROM users");
+        let mut request = Request::prepared(&DELETE, &[]);
         request.finish_command(3, 0);
         assert!(matches!(
             request.result(),
