@@ -20,7 +20,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::request::Request;
+use crate::shared::request::Request;
 
 /// A request plus the one bit its caller can still set after handing it over.
 ///

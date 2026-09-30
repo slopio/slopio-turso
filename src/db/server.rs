@@ -14,7 +14,7 @@
 //! readers keep going while its fsync is in flight. A write is only answered
 //! once the commit succeeded; a failed one is answered at once.
 //!
-//! This is the other half of the handoff protocol in [`crate::pending`].
+//! This is the other half of the handoff protocol in [`crate::shared::pending`].
 
 use std::collections::VecDeque;
 use std::future::{self, poll_fn};
@@ -35,12 +35,12 @@ use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_msg_from_peer, signal_reply_to_peer, yield_now};
 use turso_core::{Database, LimboError};
 
-use crate::conn::{Conn, Step};
-use crate::io::RingIo;
-use crate::pending::Pending;
-use crate::request::{Error, Request, ResultSet};
-use crate::statement::Statement;
-use crate::transaction::TransactionId;
+use crate::db::conn::{Conn, Step};
+use crate::db::io::RingIo;
+use crate::shared::pending::Pending;
+use crate::shared::request::{Error, Request, ResultSet};
+use crate::shared::statement::Statement;
+use crate::shared::transaction::TransactionId;
 
 type Msg = Arc<Message<Pending>>;
 

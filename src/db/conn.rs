@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use turso_core::{Connection, LimboError, Statement as Prepared, StepResult};
 
-use crate::request::{Error, Request};
-use crate::statement::Statement;
+use crate::shared::request::{Error, Request};
+use crate::shared::statement::Statement;
 
 /// How many VM instructions run between two looks at the cancel flag.
 const CANCEL_CHECK_OPS: u64 = 1000;
@@ -194,7 +194,7 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::ResultSet;
+    use crate::shared::request::ResultSet;
     use turso_core::{Database, MemoryIO, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
     /// An in-memory database; `name` keeps tests apart in turso's registry.

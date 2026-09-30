@@ -4,7 +4,12 @@
 //! The request is shared, not handed over: this side keeps a clone of the
 //! `Arc<Message<Pending>>` in the awaiting future, so the DB thread's answer
 //! needs to carry nothing but a wakeup. The discipline that makes the sharing
-//! sound lives in [`crate::pending`]; this module is one of its two halves.
+//! sound lives in [`crate::shared::pending`]; this module is one of its two halves.
+
+pub mod query;
+mod transaction;
+
+pub use transaction::TransactionToken;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,10 +21,9 @@ use slopio::runtime::{ReplySignal, send_shared_to_peer, thread_id};
 
 use turso_core::ValueRef;
 
-use crate::pending::Pending;
-use crate::query::{Query, Rows};
-use crate::request::{Error, Request, ResultSet};
-use crate::transaction::TransactionToken;
+use crate::client::query::{Query, Rows};
+use crate::shared::pending::Pending;
+use crate::shared::request::{Error, Request, ResultSet};
 
 /// A handle from a caller thread to the DB thread.
 #[derive(Debug, Clone, Copy)]
@@ -60,7 +64,7 @@ impl Client {
         );
         let msg = Message::with_header(header, Pending::new(request));
         // SAFETY: a clone survives here, so the payload really is shared; the
-        // handoff protocol in `crate::pending` is what makes that sound — we
+        // handoff protocol in `crate::shared::pending` is what makes that sound — we
         // touch nothing but the cancellation flag until the wakeup lands.
         unsafe { send_shared_to_peer(self.db_thread, Arc::clone(&msg)) };
         PendingQuery {

@@ -12,8 +12,8 @@ use self_cell::self_cell;
 use turso_core::types::TextRef;
 use turso_core::{LimboError, Value, ValueRef};
 
-use crate::statement::Statement;
-use crate::transaction::TransactionId;
+use crate::shared::statement::Statement;
+use crate::shared::transaction::TransactionId;
 
 /// One row: its columns, each borrowing the arena. The spine lives in the
 /// arena too — no heap allocation per row.
@@ -71,7 +71,7 @@ self_cell!(
 // no thread-affine state and its chunks come from the global allocator, so
 // allocating on one thread and freeing on another is fine. A `Request` is only
 // ever accessed by one thread at a time — see the handoff protocol in
-// `crate::pending` — and the `MSG_RING` hop provides the happens-before.
+// `crate::shared::pending` — and the `MSG_RING` hop provides the happens-before.
 //
 // We deliberately do NOT implement `Sync`, and it would be **unsound** to:
 // `ResultSet` is public and `BumpVec::bump()` hands out `&Bump`, whose `alloc`

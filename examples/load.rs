@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 
 use slopio::runtime::{recv_from_peer, send_to_peer, spawn};
 use slopio::thread_per_core;
-use slopio_turso::client::Client;
-use slopio_turso::io::RingIo;
-use slopio_turso::request::{Request, ResultSet};
-use slopio_turso::server::{Config, Server};
-use slopio_turso::statement::Statement;
+use slopio_turso::Client;
+use slopio_turso::RingIo;
+use slopio_turso::Statement;
+use slopio_turso::{Config, Server};
+use slopio_turso::{Request, ResultSet};
 use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;

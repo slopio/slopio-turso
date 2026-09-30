@@ -15,8 +15,8 @@ use std::marker::PhantomData;
 
 use turso_core::{Numeric, ValueRef};
 
-use crate::request::{Error, Request, ResultSet};
-use crate::statement::Statement;
+use crate::shared::request::{Error, Request, ResultSet};
+use crate::shared::statement::Statement;
 
 /// A statically-declared query: its identity, SQL, and row type + mapping.
 pub trait Query {

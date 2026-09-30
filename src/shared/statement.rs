@@ -3,7 +3,7 @@
 //! Define each statement as a `static`:
 //!
 //! ```
-//! use slopio_turso::statement::Statement;
+//! use slopio_turso::Statement;
 //!
 //! static GET_USER: Statement = Statement::new("SELECT id, name FROM users WHERE id = ?1");
 //! ```
@@ -18,7 +18,7 @@
 //! `static`, turns them into a compile error:
 //!
 //! ```compile_fail
-//! use slopio_turso::statement::Statement;
+//! use slopio_turso::Statement;
 //!
 //! static READ_WRITE: Statement = Statement::new("PRAGMA query_only = 0");
 //! ```
