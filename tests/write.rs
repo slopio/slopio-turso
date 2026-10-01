@@ -9,7 +9,7 @@ use std::time::Duration;
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
-use slopio::{Cpu, Dedicated, Topology};
+use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::{Client, Error, FromRow, Read, Row, Write};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
@@ -44,62 +44,69 @@ fn every_write_is_answered_with_what_happened() {
     seed(&path);
 
     let (tx, rx) = mpsc::channel();
-    let anywhere = Dedicated {
-        cpu: Cpu::Auto,
-        sqpoll: None,
+    // No DEFER_TASKRUN: a busy thread still gets its messages promptly.
+    let ring = RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
     };
     let mut topology = Topology::new();
     let db_path = path.clone();
-    topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
-        match select(slopio_turso::db::serve(&db_path, Default::default()), stop).await {
-            SelectResult::First(()) => unreachable!("serve never returns"),
-            SelectResult::Second(SelectResult::First(_stop)) => {}
-            SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let db_path = db_path.clone();
+        async move {
+            let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
+            match select(slopio_turso::db::serve(&db_path, Default::default()), stop).await {
+                SelectResult::First(()) => unreachable!("serve never returns"),
+                SelectResult::Second(SelectResult::First(_stop)) => {}
+                SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+            }
         }
     });
-    topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let client = Client::connect(DB_THREAD).await.unwrap();
-        let work = async {
-            // A write, then a read of it from the same task.
-            let name = Value::build_text("alice");
-            client
-                .write(&INSERT_USER, vec![int(10), name])
-                .await
-                .unwrap();
-            let alice = client.read_one::<User>(&GET_USER, vec![int(10)]).await;
-            assert_eq!(alice.unwrap().unwrap().name, "alice");
-
-            // Sent together, so they likely share a batch; id 1 already exists.
-            let writes: Vec<_> = [20, 1, 21]
-                .into_iter()
-                .map(|id| {
-                    let c = client.clone();
-                    let name = Value::build_text(format!("user{id}-new"));
-                    slopio::spawn(
-                        async move { (id, c.write(&INSERT_USER, vec![int(id), name]).await) },
-                    )
-                })
-                .collect();
-            for write in writes {
-                let (id, written) = write.await;
-                let row = client
-                    .read_one::<User>(&GET_USER, vec![int(id)])
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let tx = tx.clone();
+        async move {
+            let client = Client::connect(DB_THREAD).await.unwrap();
+            let work = async {
+                // A write, then a read of it from the same task.
+                let name = Value::build_text("alice");
+                client
+                    .write(&INSERT_USER, vec![int(10), name])
                     .await
                     .unwrap();
-                let new = row.is_some_and(|user| user.name.ends_with("-new"));
-                assert_eq!(written.is_ok(), new, "write {id} answered {written:?}");
-                if id == 1 {
-                    assert!(matches!(written, Err(Error::Turso(_))), "{written:?}");
+                let alice = client.read_one::<User>(&GET_USER, vec![int(10)]).await;
+                assert_eq!(alice.unwrap().unwrap().name, "alice");
+
+                // Sent together, so they likely share a batch; id 1 already exists.
+                let writes: Vec<_> = [20, 1, 21]
+                    .into_iter()
+                    .map(|id| {
+                        let c = client.clone();
+                        let name = Value::build_text(format!("user{id}-new"));
+                        slopio::spawn(async move {
+                            (id, c.write(&INSERT_USER, vec![int(id), name]).await)
+                        })
+                    })
+                    .collect();
+                for write in writes {
+                    let (id, written) = write.await;
+                    let row = client
+                        .read_one::<User>(&GET_USER, vec![int(id)])
+                        .await
+                        .unwrap();
+                    let new = row.is_some_and(|user| user.name.ends_with("-new"));
+                    assert_eq!(written.is_ok(), new, "write {id} answered {written:?}");
+                    if id == 1 {
+                        assert!(matches!(written, Err(Error::Turso(_))), "{written:?}");
+                    }
                 }
-            }
-        };
-        let finished = matches!(
-            select(work, Sleep::during(TIMEOUT)).await,
-            SelectResult::First(())
-        );
-        send_to_peer(DB_THREAD, 0, 0);
-        tx.send(finished).unwrap();
+            };
+            let finished = matches!(
+                select(work, Sleep::during(TIMEOUT)).await,
+                SelectResult::First(())
+            );
+            send_to_peer(DB_THREAD, 0, 0);
+            tx.send(finished).unwrap();
+        }
     });
     topology.run();
     remove(&path);

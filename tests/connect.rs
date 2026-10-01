@@ -12,7 +12,7 @@ use std::time::Duration;
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
-use slopio::{Cpu, Dedicated, Topology};
+use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::{Client, Error};
 use turso_core::Database;
 
@@ -26,25 +26,32 @@ type Connected = Result<Arc<Database>, Error>;
 fn connect_twice(path: &str) -> (Connected, Connected) {
     let path = path.to_owned();
     let (tx, rx) = mpsc::channel();
-    let anywhere = Dedicated {
-        cpu: Cpu::Auto,
-        sqpoll: None,
+    // No DEFER_TASKRUN: a busy thread still gets its messages promptly.
+    let ring = RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
     };
     let mut topology = Topology::new();
-    let db_thread = topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
-        match select(slopio_turso::db::serve(&path, Default::default()), stop).await {
-            SelectResult::First(()) => unreachable!("serve never returns"),
-            SelectResult::Second(SelectResult::First(_stop)) => {}
-            SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+    let db_thread = topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let path = path.clone();
+        async move {
+            let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
+            match select(slopio_turso::db::serve(&path, Default::default()), stop).await {
+                SelectResult::First(()) => unreachable!("serve never returns"),
+                SelectResult::Second(SelectResult::First(_stop)) => {}
+                SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+            }
         }
     });
-    assert_eq!(db_thread, DB_THREAD);
-    topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let first = connect().await;
-        let second = connect().await;
-        send_to_peer(DB_THREAD, 0, 0);
-        tx.send((first, second)).unwrap();
+    assert_eq!(db_thread.start, DB_THREAD);
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let tx = tx.clone();
+        async move {
+            let first = connect().await;
+            let second = connect().await;
+            send_to_peer(DB_THREAD, 0, 0);
+            tx.send((first, second)).unwrap();
+        }
     });
     topology.run();
     rx.recv().unwrap()

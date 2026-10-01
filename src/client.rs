@@ -6,6 +6,7 @@ use std::sync::Arc;
 use turso_core::{Database, Value};
 
 use crate::conn::{self, Conn};
+use crate::db::Shared;
 use crate::reader::{self, Queue};
 use crate::request::{self, Body};
 use crate::row::FromRow;
@@ -18,7 +19,8 @@ use crate::{Error, Read, Write};
 /// thread's writer.
 #[derive(Clone)]
 pub struct Client {
-    db: Arc<Database>,
+    /// The database, and where writes go.
+    shared: Arc<Shared>,
     db_thread: usize,
     reads: Rc<Queue>,
 }
@@ -30,12 +32,12 @@ impl Client {
         let Body::Opened(db) = request::send(db_thread, Body::Connect).await else {
             unreachable!("a `Connect` is answered with `Opened`");
         };
-        let db = db?;
-        let conn = Conn::new(&db, "BEGIN")?;
+        let shared = db?;
+        let conn = Conn::new(&shared.db, "BEGIN")?;
         let reads = Rc::new(Queue::new());
         slopio::spawn(reader::run(conn, reads.clone()));
         Ok(Client {
-            db,
+            shared,
             db_thread,
             reads,
         })
@@ -69,14 +71,15 @@ impl Client {
     /// once its batch has committed.
     pub async fn write(&self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
         let body = Body::Write { statement, params };
-        let Body::Written(written) = request::send(self.db_thread, body).await else {
+        let Body::Written(written) = request::push(self.db_thread, &self.shared.writes, body).await
+        else {
             unreachable!("a `Write` is answered with `Written`");
         };
         written
     }
 
     pub fn database(&self) -> &Arc<Database> {
-        &self.db
+        &self.shared.db
     }
 }
 

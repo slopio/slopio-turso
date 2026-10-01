@@ -11,11 +11,11 @@ use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::{Database, SyncMode};
+use turso_core::SyncMode;
 
 use crate::Error;
 use crate::conn::{self, Conn};
-use crate::db::{Config, Synchronous};
+use crate::db::{Config, Shared, Synchronous};
 use crate::request::{Body, Msg, reply};
 
 /// The most writes one transaction serves: a full batch commits at once.
@@ -31,8 +31,8 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    pub(crate) fn new(db: &Arc<Database>, config: &Config) -> Result<Self, Error> {
-        let conn = Conn::new(db, "BEGIN IMMEDIATE")?;
+    pub(crate) fn new(shared: &Arc<Shared>, config: &Config) -> Result<Self, Error> {
+        let conn = Conn::new(&shared.db, "BEGIN IMMEDIATE")?;
         conn.set_sync_mode(match config.synchronous {
             Synchronous::Full => SyncMode::Full,
             Synchronous::Normal => SyncMode::Normal,

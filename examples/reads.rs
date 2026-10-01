@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use slopio::runtime::select::select;
 use slopio::runtime::{recv_from_peer, send_to_peer};
-use slopio::{Cpu, Dedicated, Topology};
+use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::db::{Config, Synchronous};
 use slopio_turso::{Client, Error, FromRow, Read, Row, Write};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
@@ -81,27 +81,30 @@ fn main() {
     remove_files();
     seed();
 
-    let anywhere = Dedicated {
-        cpu: Cpu::Auto,
-        sqpoll: None,
+    // No DEFER_TASKRUN: a busy worker still gets its replies promptly.
+    let ring = RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
     };
     let (tx, rx) = mpsc::channel();
     let mut topology = Topology::new();
     let workers = args.workers;
     let config = args.config;
-    let db_thread = topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        // Serves until every worker said it is done.
-        let stop = async {
-            for _ in 0..workers {
-                recv_from_peer().await;
-            }
-        };
-        select(slopio_turso::db::serve(PATH, config), stop).await;
-    });
-    for _ in 0..args.workers {
+    let db_thread = topology
+        .group::<(), _, _>(Threads::Auto(1), ring, move |_| async move {
+            // Serves until every worker said it is done.
+            let stop = async {
+                for _ in 0..workers {
+                    recv_from_peer().await;
+                }
+            };
+            select(slopio_turso::db::serve(PATH, config), stop).await;
+        })
+        .start;
+    let (tasks, seconds, writes, split) = (args.tasks, args.seconds, args.writes, args.split);
+    topology.group::<(), _, _>(Threads::Auto(args.workers), ring, move |ctx| {
         let tx = tx.clone();
-        let (tasks, seconds, writes, split) = (args.tasks, args.seconds, args.writes, args.split);
-        topology.dedicated::<(), _, _>(anywhere, move |ctx| async move {
+        async move {
             let client = Client::connect(db_thread).await.unwrap();
             let deadline = Instant::now() + Duration::from_secs(seconds);
             let handles: Vec<_> = (0..tasks)
@@ -121,9 +124,8 @@ fn main() {
             }
             send_to_peer(db_thread, 0, 0);
             tx.send((ctx.thread_id, tally)).unwrap();
-        });
-    }
-    drop(tx);
+        }
+    });
     topology.run();
 
     let mut results: Vec<_> = rx.iter().collect();
@@ -153,6 +155,8 @@ fn main() {
     );
     println!("reads:  {}", percentiles(&mut total.read_latencies));
     println!("writes: {}", percentiles(&mut total.write_latencies));
+    let wal = std::fs::metadata(format!("{PATH}-wal")).map_or(0, |m| m.len());
+    println!("wal file: {:.1} MB", wal as f64 / 1e6);
     remove_files();
 }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
-use slopio::{Cpu, Dedicated, Topology};
+use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::{Client, Error, FromRow, Read, Row};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
@@ -63,83 +63,92 @@ fn each_read_of_a_batch_gets_its_own_answer() {
     seed(&path);
 
     let (tx, rx) = mpsc::channel();
-    let anywhere = Dedicated {
-        cpu: Cpu::Auto,
-        sqpoll: None,
+    // No DEFER_TASKRUN: a busy thread still gets its messages promptly.
+    let ring = RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
     };
     let mut topology = Topology::new();
     let db_path = path.clone();
-    topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
-        match select(slopio_turso::db::serve(&db_path, Default::default()), stop).await {
-            SelectResult::First(()) => unreachable!("serve never returns"),
-            SelectResult::Second(SelectResult::First(_stop)) => {}
-            SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let db_path = db_path.clone();
+        async move {
+            let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
+            match select(slopio_turso::db::serve(&db_path, Default::default()), stop).await {
+                SelectResult::First(()) => unreachable!("serve never returns"),
+                SelectResult::Second(SelectResult::First(_stop)) => {}
+                SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+            }
         }
     });
-    topology.dedicated::<(), _, _>(anywhere, move |_| async move {
-        let client = Client::connect(DB_THREAD).await.unwrap();
-        // Every read is spawned before any runs: they reach the reader together.
-        let c = client.clone();
-        let one = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(2)).await });
-        let c = client.clone();
-        let none = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(9)).await });
-        let c = client.clone();
-        let all = slopio::spawn(async move { c.read::<User>(&ALL_USERS, vec![]).await });
-        let c = client.clone();
-        let too_many = slopio::spawn(async move { c.read_one::<User>(&ALL_USERS, vec![]).await });
-        let c = client.clone();
-        let no_param = slopio::spawn(async move { c.read_one::<User>(&GET_USER, vec![]).await });
-        let c = client.clone();
-        let two_params = slopio::spawn(async move {
-            let params = vec![id(1).remove(0), id(1).remove(0)];
-            c.read_one::<User>(&GET_USER, params).await
-        });
-        let c = client.clone();
-        let no_column = slopio::spawn(async move { c.read::<Third>(&ALL_USERS, vec![]).await });
-        let c = client.clone();
-        let missing = slopio::spawn(async move { c.read::<User>(&MISSING, vec![]).await });
-        let c = client.clone();
-        let bad_json = slopio::spawn(async move { c.read::<User>(&BAD_JSON, vec![]).await });
-        let c = client.clone();
-        let after = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(3)).await });
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let tx = tx.clone();
+        async move {
+            let client = Client::connect(DB_THREAD).await.unwrap();
+            // Every read is spawned before any runs: they reach the reader together.
+            let c = client.clone();
+            let one = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(2)).await });
+            let c = client.clone();
+            let none = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(9)).await });
+            let c = client.clone();
+            let all = slopio::spawn(async move { c.read::<User>(&ALL_USERS, vec![]).await });
+            let c = client.clone();
+            let too_many =
+                slopio::spawn(async move { c.read_one::<User>(&ALL_USERS, vec![]).await });
+            let c = client.clone();
+            let no_param =
+                slopio::spawn(async move { c.read_one::<User>(&GET_USER, vec![]).await });
+            let c = client.clone();
+            let two_params = slopio::spawn(async move {
+                let params = vec![id(1).remove(0), id(1).remove(0)];
+                c.read_one::<User>(&GET_USER, params).await
+            });
+            let c = client.clone();
+            let no_column = slopio::spawn(async move { c.read::<Third>(&ALL_USERS, vec![]).await });
+            let c = client.clone();
+            let missing = slopio::spawn(async move { c.read::<User>(&MISSING, vec![]).await });
+            let c = client.clone();
+            let bad_json = slopio::spawn(async move { c.read::<User>(&BAD_JSON, vec![]).await });
+            let c = client.clone();
+            let after = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(3)).await });
 
-        let work = async {
-            let one = one.await.unwrap();
-            assert_eq!(one, Some(user(2, "b")));
-            assert_eq!(none.await.unwrap(), None);
-            let all = all.await.unwrap();
-            assert_eq!(all, vec![user(1, "a"), user(2, "b"), user(3, "c")]);
-            assert!(matches!(too_many.await, Err(Error::TooManyRows)));
-            let no_param = no_param.await;
-            assert!(matches!(
-                no_param,
-                Err(Error::Parameters {
-                    expected: 1,
-                    given: 0
-                })
-            ));
-            let two_params = two_params.await;
-            assert!(matches!(
-                two_params,
-                Err(Error::Parameters {
-                    expected: 1,
-                    given: 2
-                })
-            ));
-            assert!(matches!(no_column.await, Err(Error::NoColumn(2))));
-            assert!(matches!(missing.await, Err(Error::Turso(_))));
-            assert!(matches!(bad_json.await, Err(Error::Turso(_))));
-            // turso rolled back the shared transaction on that error; the rest
-            // of the batch still reads.
-            assert_eq!(after.await.unwrap(), Some(user(3, "c")));
-        };
-        let finished = matches!(
-            select(work, Sleep::during(TIMEOUT)).await,
-            SelectResult::First(())
-        );
-        send_to_peer(DB_THREAD, 0, 0);
-        tx.send(finished).unwrap();
+            let work = async {
+                let one = one.await.unwrap();
+                assert_eq!(one, Some(user(2, "b")));
+                assert_eq!(none.await.unwrap(), None);
+                let all = all.await.unwrap();
+                assert_eq!(all, vec![user(1, "a"), user(2, "b"), user(3, "c")]);
+                assert!(matches!(too_many.await, Err(Error::TooManyRows)));
+                let no_param = no_param.await;
+                assert!(matches!(
+                    no_param,
+                    Err(Error::Parameters {
+                        expected: 1,
+                        given: 0
+                    })
+                ));
+                let two_params = two_params.await;
+                assert!(matches!(
+                    two_params,
+                    Err(Error::Parameters {
+                        expected: 1,
+                        given: 2
+                    })
+                ));
+                assert!(matches!(no_column.await, Err(Error::NoColumn(2))));
+                assert!(matches!(missing.await, Err(Error::Turso(_))));
+                assert!(matches!(bad_json.await, Err(Error::Turso(_))));
+                // turso rolled back the shared transaction on that error; the rest
+                // of the batch still reads.
+                assert_eq!(after.await.unwrap(), Some(user(3, "c")));
+            };
+            let finished = matches!(
+                select(work, Sleep::during(TIMEOUT)).await,
+                SelectResult::First(())
+            );
+            send_to_peer(DB_THREAD, 0, 0);
+            tx.send(finished).unwrap();
+        }
     });
     topology.run();
     remove(&path);

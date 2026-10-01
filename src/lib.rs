@@ -8,6 +8,7 @@ mod client;
 mod conn;
 pub mod db;
 mod error;
+mod inbox;
 mod reader;
 mod request;
 mod row;

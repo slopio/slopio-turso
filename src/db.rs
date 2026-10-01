@@ -1,12 +1,13 @@
 //! The DB thread: owns the database and its one writer.
 //!
-//! Workers send it [`Request`]s over MSG_RING: a `Connect` for the database,
-//! then their writes. It opens the database before it reads its inbox, so a
-//! request sent during the open simply waits there: no queue of our own.
+//! Workers send it a `Connect` over MSG_RING for the database, then push their
+//! writes into the shared [`Inbox`] and ring its doorbell over MSG_RING. It
+//! opens the database before it reads its messages, so a `Connect` sent during
+//! the open simply waits: no queue of our own.
 //!
-//! Each turn it takes every request already in its inbox: a `Connect` is
-//! answered at once, the writes run on the writer, which commits once its
-//! commit interval allows it.
+//! Each turn it answers the `Connect`s that came, takes every write in the
+//! inbox and runs them on the writer, which commits once its commit interval
+//! allows it.
 
 use std::future::poll_fn;
 use std::pin::pin;
@@ -19,6 +20,7 @@ use slopio::runtime::select::{SelectResult, select};
 use turso_core::{Database, OpenOptions, SqliteDialect, UnixIO};
 
 use crate::Error;
+use crate::inbox::Inbox;
 use crate::request::{Body, Msg, Request, reply};
 use crate::timer::Timer;
 use crate::writer::{MAX_BATCH, Writer};
@@ -30,6 +32,13 @@ pub struct Config {
     /// page cache, so fewer commits mean faster reads, for writes that may
     /// wait up to this long. Zero commits as soon as the inbox is drained.
     pub commit_interval: Duration,
+}
+
+/// What the DB thread shares with every worker.
+pub(crate) struct Shared {
+    pub(crate) db: Arc<Database>,
+    /// Where workers push their writes.
+    pub(crate) writes: Inbox,
 }
 
 /// When a commit is on disk. `OFF`, which can corrupt the database on a power
@@ -71,32 +80,37 @@ pub async fn serve(path: &str, config: Config) {
             drain(&opened, &mut writes).await;
         }
         match &mut opened {
-            Ok((_, writer)) => {
+            Ok((shared, writer)) => {
+                shared.writes.take(&mut writes);
                 writer.write(&mut writes);
                 if writer.commit_at().is_some_and(|at| at <= Instant::now()) {
                     writer.commit();
                 }
             }
-            Err(error) => {
-                for msg in writes.drain(..) {
-                    reply(msg, Body::Written(Err(error.clone())));
-                }
-            }
+            // No inbox was handed out: no writes.
+            Err(_) => {}
         }
     }
 }
 
-fn open(path: &str, config: &Config) -> Result<(Arc<Database>, Writer), Error> {
+/// What the workers share, and the writer.
+type Opened = Result<(Arc<Shared>, Writer), Error>;
+
+fn open(path: &str, config: &Config) -> Opened {
     let io = Arc::new(UnixIO::new()?);
     let db = Database::open(io, path, OpenOptions::new(Arc::new(SqliteDialect)))?;
-    let writer = Writer::new(&db, config)?;
-    Ok((db, writer))
+    let shared = Arc::new(Shared {
+        db,
+        writes: Inbox::new(),
+    });
+    let writer = Writer::new(&shared, config)?;
+    Ok((shared, writer))
 }
 
-/// Takes every request already sent, up to a batch of writes. The runtime only
-/// moves so many arrivals into the inbox per turn: while some came, yield to
-/// let it move the next ones.
-async fn drain(opened: &Result<(Arc<Database>, Writer), Error>, writes: &mut Vec<Msg>) {
+/// Takes every message already sent. The runtime only moves so many arrivals
+/// into the thread's inbox per turn: while some came, yield to let it move the
+/// next ones.
+async fn drain(opened: &Opened, writes: &mut Vec<Msg>) {
     loop {
         let mut came = false;
         while writes.len() < MAX_BATCH
@@ -112,13 +126,15 @@ async fn drain(opened: &Result<(Arc<Database>, Writer), Error>, writes: &mut Vec
     }
 }
 
-/// Answers a `Connect` at once; keeps a write for the writer.
-fn take(opened: &Result<(Arc<Database>, Writer), Error>, msg: Msg, writes: &mut Vec<Msg>) {
+/// Answers a `Connect` at once; a doorbell only woke the thread, the writes
+/// are in the inbox.
+fn take(opened: &Opened, msg: Msg, writes: &mut Vec<Msg>) {
     match msg.payload.body() {
         Body::Connect => {
-            let db = opened.as_ref().map(|(db, _)| db.clone());
-            reply(msg, Body::Opened(db.map_err(Error::clone)));
+            let shared = opened.as_ref().map(|(shared, _)| shared.clone());
+            reply(msg, Body::Opened(shared.map_err(Error::clone)));
         }
+        Body::Doorbell => {}
         Body::Write { .. } => writes.push(msg),
         Body::Opened(_) | Body::Written(_) => unreachable!("an answer sent as a request"),
     }
