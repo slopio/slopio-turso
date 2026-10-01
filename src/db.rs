@@ -20,18 +20,34 @@ use slopio::runtime::select::{SelectResult, select};
 use turso_core::{Database, OpenOptions, SqliteDialect, UnixIO};
 
 use crate::Error;
+use crate::gate::ReadGate;
 use crate::inbox::Inbox;
 use crate::request::{Body, Msg, Request, reply};
 use crate::timer::Timer;
 use crate::writer::{MAX_BATCH, Writer};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub synchronous: Synchronous,
     /// The least time between two commits. Each commit wipes every reader's
     /// page cache, so fewer commits mean faster reads, for writes that may
     /// wait up to this long. Zero commits as soon as the inbox is drained.
     pub commit_interval: Duration,
+    /// The WAL size, in pages, past which the writer pauses the readers to
+    /// empty it. Readers that never pause keep it from ever restarting, so it
+    /// would grow without end. Zero never empties it.
+    pub wal_limit: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            synchronous: Synchronous::default(),
+            commit_interval: Duration::ZERO,
+            // About 64 MB of 4 KiB pages: rare enough to cost nearly nothing.
+            wal_limit: 16_000,
+        }
+    }
 }
 
 /// What the DB thread shares with every worker.
@@ -39,6 +55,8 @@ pub(crate) struct Shared {
     pub(crate) db: Arc<Database>,
     /// Where workers push their writes.
     pub(crate) writes: Inbox,
+    /// What readers pass to start a read transaction.
+    pub(crate) gate: ReadGate,
 }
 
 /// When a commit is on disk. `OFF`, which can corrupt the database on a power
@@ -102,6 +120,7 @@ fn open(path: &str, config: &Config) -> Opened {
     let shared = Arc::new(Shared {
         db,
         writes: Inbox::new(),
+        gate: ReadGate::new(),
     });
     let writer = Writer::new(&shared, config)?;
     Ok((shared, writer))

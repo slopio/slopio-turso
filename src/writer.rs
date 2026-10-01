@@ -6,6 +6,9 @@
 //! `commit_interval`: when the last commit is older than that, the writes
 //! commit at once; otherwise they wait for the interval to pass, and so do the
 //! writes that arrive meanwhile.
+//!
+//! Past `wal_limit` pages of WAL, after a commit, the writer closes the
+//! readers' gate and empties the WAL.
 
 use std::mem;
 use std::sync::Arc;
@@ -21,9 +24,15 @@ use crate::request::{Body, Msg, reply};
 /// The most writes one transaction serves: a full batch commits at once.
 pub(crate) const MAX_BATCH: usize = 256;
 
+/// How long the writer waits for the read transactions in progress to end
+/// before giving up on emptying the WAL until its next commit.
+const READERS_PATIENCE: Duration = Duration::from_millis(5);
+
 pub(crate) struct Writer {
     conn: Conn,
+    shared: Arc<Shared>,
     commit_interval: Duration,
+    wal_limit: u64,
     /// When the last commit started; `None` before the first.
     last_commit: Option<Instant>,
     /// The open transaction's writes with their outcome, held until it commits.
@@ -39,7 +48,9 @@ impl Writer {
         });
         Ok(Writer {
             conn,
+            shared: shared.clone(),
             commit_interval: config.commit_interval,
+            wal_limit: config.wal_limit,
             last_commit: None,
             held: Vec::with_capacity(MAX_BATCH),
         })
@@ -93,6 +104,27 @@ impl Writer {
             self.fail_held(error);
         }
         self.answer_held();
+        self.empty_wal_past_limit();
+    }
+
+    /// Past `wal_limit`: restarts the WAL. The costly part, copying it into
+    /// the database file and its fsyncs, runs while the readers go on; they
+    /// only pause, about 2 ms, for the pages committed meanwhile and the
+    /// restart. Gives up until the next commit if the readers take too long
+    /// to pause.
+    fn empty_wal_past_limit(&mut self) {
+        let past = self
+            .conn
+            .wal_pages()
+            .is_ok_and(|pages| self.wal_limit > 0 && pages >= self.wal_limit);
+        if !past {
+            return;
+        }
+        let _ = self.conn.checkpoint_wal();
+        if self.shared.gate.close(READERS_PATIENCE) {
+            let _ = self.conn.restart_wal();
+            self.shared.gate.open();
+        }
     }
 
     fn run(&mut self, msg: &Msg) -> Result<(), Error> {

@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release --example reads -- [--workers 3] [--tasks 64] [--seconds 5] [--writes 0] [--split 0]
-//!     [--synchronous full|normal] [--interval-us 0]
+//!     [--synchronous full|normal] [--interval-us 0] [--wal-limit 16000]
 //! ```
 //!
 //! `--split 1`: instead of every task writing `--writes` percent of the time,
@@ -266,6 +266,7 @@ fn parse_args() -> Args {
             "--writes" => args.writes = value() as u64,
             "--split" => args.split = value() != 0,
             "--interval-us" => args.config.commit_interval = Duration::from_micros(value() as u64),
+            "--wal-limit" => args.config.wal_limit = value() as u64,
             "--synchronous" => {
                 args.config.synchronous = match flag_value.as_str() {
                     "full" => Synchronous::Full,

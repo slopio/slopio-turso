@@ -6,7 +6,9 @@ use std::collections::hash_map::{Entry, HashMap};
 use std::num::NonZero;
 use std::sync::Arc;
 
-use turso_core::{Connection, Database, IO, LimboError, Statement, StepResult, SyncMode, Value};
+use turso_core::{
+    CheckpointMode, Connection, Database, IO, LimboError, Statement, StepResult, SyncMode, Value,
+};
 
 use crate::Error;
 use crate::row::{FromRow, Row};
@@ -43,6 +45,29 @@ impl Conn {
 
     pub(crate) fn set_sync_mode(&self, mode: SyncMode) {
         self.conn.set_sync_mode(mode);
+    }
+
+    /// The WAL's size, in pages.
+    pub(crate) fn wal_pages(&self) -> Result<u64, Error> {
+        Ok(self.conn.wal_state()?.max_frame)
+    }
+
+    /// Copies what it can of the WAL into the database file, up to the
+    /// oldest read transaction in progress, without stopping anyone.
+    pub(crate) fn checkpoint_wal(&self) -> Result<(), Error> {
+        let mode = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        self.conn.checkpoint(mode)?;
+        Ok(())
+    }
+
+    /// Copies every page of the WAL into the database file and restarts it
+    /// from its beginning: the file keeps its size, writes go back to its
+    /// start. Only succeeds while no read transaction uses the WAL.
+    pub(crate) fn restart_wal(&self) -> Result<(), Error> {
+        self.conn.checkpoint(CheckpointMode::Restart)?;
+        Ok(())
     }
 
     pub(crate) fn begin(&mut self) -> Result<(), Error> {

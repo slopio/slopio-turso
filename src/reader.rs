@@ -15,12 +15,14 @@ use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use turso_core::Value;
 
 use crate::Error;
 use crate::conn::{Answer, Conn, Decode};
+use crate::db::Shared;
 
 /// The most reads one read transaction serves.
 const MAX_BATCH: usize = 64;
@@ -118,11 +120,13 @@ impl Future for Done {
 }
 
 /// The reader task: serves `queue` on `conn` until every client is gone.
-pub(crate) async fn run(mut conn: Conn, queue: Rc<Queue>) {
+pub(crate) async fn run(mut conn: Conn, queue: Rc<Queue>, shared: Arc<Shared>) {
     let mut batch = Vec::with_capacity(MAX_BATCH);
     while queue.next_batch(&mut batch).await {
+        // Even a lone read holds a snapshot of the WAL while it runs.
+        shared.gate.enter().await;
         // A lone read needs no transaction of its own making.
-        let shared = batch.len() > 1 && conn.begin().is_ok();
+        let in_tx = batch.len() > 1 && conn.begin().is_ok();
         for slot in batch.drain(..) {
             // Nobody waits for this read anymore.
             if Rc::strong_count(&slot) == 1 {
@@ -135,8 +139,9 @@ pub(crate) async fn run(mut conn: Conn, queue: Rc<Queue>) {
             }
         }
         // Never keep an old snapshot open.
-        if shared && conn.in_transaction() {
+        if in_tx && conn.in_transaction() {
             let _ = conn.commit();
         }
+        shared.gate.leave();
     }
 }

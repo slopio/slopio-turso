@@ -35,7 +35,7 @@ impl Client {
         let shared = db?;
         let conn = Conn::new(&shared.db, "BEGIN")?;
         let reads = Rc::new(Queue::new());
-        slopio::spawn(reader::run(conn, reads.clone()));
+        slopio::spawn(reader::run(conn, reads.clone(), shared.clone()));
         Ok(Client {
             shared,
             db_thread,

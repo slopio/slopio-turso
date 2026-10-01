@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --example app -- [--workers 3] [--rates 50000,100000] [--seconds 3]
-//!     [--work-us 5] [--synchronous full|normal] [--interval-us 0]
+//!     [--work-us 5] [--writes 15] [--synchronous full|normal] [--interval-us 0] [--wal-limit 16000]
 //! ```
 //!
 //! The data: 100k users, 300k posts indexed by author. Users are not equally
@@ -14,6 +14,9 @@
 //! - 15% feed: the 20 latest posts;
 //! - 10% post: a user publishes a post (an insert at the end of the table);
 //! - 5% seen: a user's `last_seen` is updated.
+//!
+//! `--writes PCT` (15 by default) changes the share of the last two, keeping
+//! profile:feed at 70:15 and post:seen at 2:1.
 //!
 //! Each request also spends `--work-us` of CPU, as a handler would.
 
@@ -96,11 +99,16 @@ enum Kind {
 const KINDS: [Kind; 4] = [Kind::Profile, Kind::Feed, Kind::Post, Kind::Seen];
 
 impl Kind {
-    fn pick(rng: &mut Rng) -> Kind {
-        match rng.next() % 100 {
-            0..70 => Kind::Profile,
-            70..85 => Kind::Feed,
-            85..95 => Kind::Post,
+    /// A request, `writes` percent of them writing.
+    fn pick(rng: &mut Rng, writes: u64) -> Kind {
+        // In thousandths, for the shares to split finely.
+        let reads = 1000 - 10 * writes;
+        let profile = reads * 70 / 85;
+        let post = reads + 10 * writes * 2 / 3;
+        match rng.next() % 1000 {
+            x if x < profile => Kind::Profile,
+            x if x < reads => Kind::Feed,
+            x if x < post => Kind::Post,
             _ => Kind::Seen,
         }
     }
@@ -112,6 +120,8 @@ struct Args {
     rates: Vec<u64>,
     seconds: u64,
     work: Duration,
+    /// Percent of requests that write.
+    writes: u64,
     config: Config,
 }
 
@@ -139,12 +149,13 @@ fn main() {
     let start = Instant::now();
     seed();
     println!(
-        "seeded {USERS} users, {POSTS} posts in {:.1?}; {} workers, {:?} of work per request, {:?}, commit interval {:?}",
+        "seeded {USERS} users, {POSTS} posts in {:.1?}; {} workers, {:?} of work per request, {:?}, commit interval {:?}, wal limit {} pages",
         start.elapsed(),
         args.workers,
         args.work,
         args.config.synchronous,
         args.config.commit_interval,
+        args.config.wal_limit,
     );
     for &rate in &args.rates {
         run(&args, rate);
@@ -173,12 +184,20 @@ fn run(args: &Args, rate: u64) {
         })
         .start;
     let per_worker = rate as f64 / args.workers as f64;
-    let (seconds, work) = (args.seconds, args.work);
+    let (seconds, work, writes) = (args.seconds, args.work, args.writes);
     topology.group::<(), _, _>(Threads::Auto(args.workers), ring, move |ctx| {
         let tx = tx.clone();
         async move {
             let client = Client::connect(db_thread).await.unwrap();
-            let tally = generate(client, per_worker, seconds, work, ctx.thread_id as u64).await;
+            let tally = generate(
+                client,
+                per_worker,
+                seconds,
+                work,
+                writes,
+                ctx.thread_id as u64,
+            )
+            .await;
             send_to_peer(db_thread, 0, 0);
             tx.send(tally).unwrap();
         }
@@ -210,7 +229,14 @@ fn run(args: &Args, rate: u64) {
 
 /// Starts requests as they come due, `rate` per second on average with random
 /// gaps, for `seconds`; then waits for the ones in progress.
-async fn generate(client: Client, rate: f64, seconds: u64, work: Duration, seed: u64) -> Tally {
+async fn generate(
+    client: Client,
+    rate: f64,
+    seconds: u64,
+    work: Duration,
+    writes: u64,
+    seed: u64,
+) -> Tally {
     let tally = Rc::new(RefCell::new(Tally::default()));
     let in_flight = Rc::new(Cell::new(0usize));
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (seed + 1));
@@ -223,7 +249,7 @@ async fn generate(client: Client, rate: f64, seconds: u64, work: Duration, seed:
             if in_flight.get() >= MAX_IN_FLIGHT {
                 tally.borrow_mut().shed += 1;
             } else {
-                let kind = Kind::pick(&mut rng);
+                let kind = Kind::pick(&mut rng, writes);
                 let user = rng.popular_user();
                 in_flight.set(in_flight.get() + 1);
                 let (client, tally, in_flight) = (client.clone(), tally.clone(), in_flight.clone());
@@ -358,6 +384,7 @@ fn parse_args() -> Args {
         rates: vec![50_000, 100_000, 200_000],
         seconds: 3,
         work: Duration::from_micros(5),
+        writes: 15,
         config: Config {
             synchronous: Synchronous::Normal,
             ..Config::default()
@@ -377,7 +404,9 @@ fn parse_args() -> Args {
             }
             "--seconds" => args.seconds = value(),
             "--work-us" => args.work = Duration::from_micros(value()),
+            "--writes" => args.writes = value(),
             "--interval-us" => args.config.commit_interval = Duration::from_micros(value()),
+            "--wal-limit" => args.config.wal_limit = value(),
             "--synchronous" => {
                 args.config.synchronous = match flag_value.as_str() {
                     "full" => Synchronous::Full,
