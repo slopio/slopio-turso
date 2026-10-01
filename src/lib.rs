@@ -1,22 +1,17 @@
-//! turso on a dedicated thread, fed by other threads over io_uring.
+//! turso on slopio's thread-per-core runtime.
 //!
-//! - [`shared`]: what travels between threads, or both sides know — the
-//!   request and its encoded values, the handoff protocol, statements, transaction ids.
-//! - [`client`]: what runs on the application's threads — sending requests,
-//!   transactions, decoding typed rows.
-//! - [`db`]: what runs on the DB thread — the server loop, the turso
-//!   connections, the IO backend.
-//!
-//! `client` and `db` only depend on `shared`, never on each other.
+//! Reads run where they are asked: every worker thread owns a read connection
+//! and steps its statements itself, sharing short read transactions between
+//! them. Writes cross to the one writer, which batches them into few commits.
 
-pub mod client;
+mod client;
 pub mod db;
-pub mod shared;
+mod error;
+mod reader;
+mod row;
+pub mod statement;
 
-pub use client::query::{DecodeError, Query, Rows};
-pub use client::{Client, TransactionToken};
-pub use db::{Config, Engine, Handle, Next, RingIo, Server, Synchronous};
-pub use shared::request::{Body, Error, Meta, Request};
-pub use shared::response::{Row, RowBuf};
-pub use shared::statement::Statement;
-pub use shared::transaction::TransactionId;
+pub use client::Client;
+pub use error::Error;
+pub use row::{FromRow, Row};
+pub use statement::{Read, Write};
