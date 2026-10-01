@@ -17,7 +17,7 @@ use slopio_turso::RingIo;
 use slopio_turso::Statement;
 use slopio_turso::client::query::{DecodeError, Query, get_str};
 use slopio_turso::{Config, Server};
-use slopio_turso::{Error, Request, ResultSet};
+use slopio_turso::{Body, Error, Request};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
@@ -50,13 +50,13 @@ static INSERT_TAG: Statement = Statement::new("INSERT INTO tags VALUES (?1)");
 static COUNT_TAGS: Statement = Statement::new("SELECT count(*) FROM tags");
 static COUNT_USERS: Statement = Statement::new("SELECT count(*) FROM users");
 
-/// A typed query: rows are decoded on the client, borrowing the arena.
+/// A typed query: rows are decoded on the client, borrowing the encoded rows.
 struct Name<'a>(&'a str);
 
 impl Query for Name<'static> {
     type Row<'a> = Name<'a>;
     const STATEMENT: &'static Statement = &NAMES;
-    fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Name<'a>, DecodeError> {
+    fn map<'a>(row: &[ValueRef<'a>]) -> Result<Name<'a>, DecodeError> {
         Ok(Name(get_str(row, 0)?))
     }
 }
@@ -69,6 +69,7 @@ async fn db_thread() {
         readers: 2,
         max_rows: 100,
         transaction_timeout: TRANSACTION_TIMEOUT,
+        ..Config::default()
     };
     let serving = Server::new(&db, &config).unwrap().serve(io);
     match select(serving, select(recv_from_peer(), Sleep::during(TIMEOUT))).await {
@@ -79,9 +80,10 @@ async fn db_thread() {
 }
 
 async fn client_thread() {
+    let client = Client::new(DB_THREAD);
     let all = async {
-        queries().await;
-        transactions().await;
+        queries(&client).await;
+        transactions(&client).await;
     };
     match select(all, Sleep::during(TIMEOUT)).await {
         SelectResult::First(()) => send_to_peer(DB_THREAD, 0, 0),
@@ -89,19 +91,18 @@ async fn client_thread() {
     }
 }
 
-async fn queries() {
-    let client = Client::new(DB_THREAD);
+async fn queries(client: &Client) {
     let run = |statement: &'static Statement, params: &[ValueRef<'_>]| {
-        client.query(Request::prepared(statement, params))
+        client.query(Request::new(statement, params))
     };
 
     let done = run(&CREATE_USERS, &[]).await;
-    assert!(matches!(done.result(), ResultSet::Command { .. }));
+    assert!(matches!(done.body(), Body::Command { .. }));
     for name in ["ada", "bob"] {
         let done = run(&INSERT_USER, &[Value::from_text(name).as_ref()]).await;
         assert!(matches!(
-            done.result(),
-            ResultSet::Command { changes: 1, .. }
+            done.body(),
+            Body::Command { changes: 1, .. }
         ));
     }
 
@@ -110,7 +111,7 @@ async fn queries() {
     assert_eq!(names, ["ada", "bob"]);
 
     let done = run(&MISSING, &[]).await;
-    assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
+    assert!(matches!(done.body(), Body::Error(Error::Turso(_))));
 
     // Abandoning the future cancels the request on the DB thread, which still
     // signals and moves on to the next one.
@@ -130,12 +131,12 @@ async fn queries() {
     .await;
     for write in [a, c] {
         assert!(matches!(
-            write.result(),
-            ResultSet::Command { changes: 1, .. }
+            write.body(),
+            Body::Command { changes: 1, .. }
         ));
     }
     for read in [b, d] {
-        assert!(matches!(read.result(), ResultSet::Rows(_)));
+        assert!(matches!(read.body(), Body::Rows(_)));
     }
 
     // Writes in flight together share a batch: a failing one leaves the others
@@ -144,7 +145,7 @@ async fn queries() {
     let [x, y, z] = ["x", "y", "z"].map(Value::from_text);
     let tag = |name: &Value| run(&INSERT_TAG, &[name.as_ref()]);
     let (a, b, c, d) = join4(tag(&x), tag(&y), tag(&x), tag(&z)).await;
-    let failed = [&a, &b, &c, &d].map(|done| matches!(done.result(), ResultSet::Error(_)));
+    let failed = [&a, &b, &c, &d].map(|done| matches!(done.body(), Body::Error(_)));
     assert_eq!(
         failed.iter().filter(|&&f| f).count(),
         1,
@@ -152,27 +153,26 @@ async fn queries() {
     );
     assert!(!failed[1] && !failed[3]);
     let done = run(&COUNT_TAGS, &[]).await;
-    let tags = done.rows_iter().next().unwrap()[0];
+    let tags = done.body().rows().next().unwrap().get(0).unwrap();
     assert!(matches!(tags, ValueRef::Numeric(Numeric::Integer(3))));
 
     let done = run(&COUNT_USERS, &[]).await;
-    let count = done.rows_iter().next().unwrap()[0];
+    let count = done.body().rows().next().unwrap().get(0).unwrap();
     assert!(matches!(count, ValueRef::Numeric(Numeric::Integer(4))));
 }
 
 /// Interactive transactions through their token.
-async fn transactions() {
-    let client = Client::new(DB_THREAD);
+async fn transactions(client: &Client) {
     let count = || async move {
-        let done = client.query(Request::prepared(&COUNT_USERS, &[])).await;
-        match done.rows_iter().next().unwrap()[0] {
+        let done = client.query(Request::new(&COUNT_USERS, &[])).await;
+        match done.body().rows().next().unwrap().get(0).unwrap() {
             ValueRef::Numeric(Numeric::Integer(n)) => n,
             other => panic!("not a count: {other:?}"),
         }
     };
     let insert = |name: &str| {
         let name = Value::from_text(name.to_owned());
-        Request::prepared(&INSERT_USER, &[name.as_ref()])
+        Request::new(&INSERT_USER, &[name.as_ref()])
     };
     let before = count().await;
 
@@ -185,12 +185,12 @@ async fn transactions() {
     );
     let (tx, done) = client.query_in(tx, insert("eve")).await;
     assert!(matches!(
-        done.result(),
-        ResultSet::Command { changes: 1, .. }
+        done.body(),
+        Body::Command { changes: 1, .. }
     ));
     // In turso a failed statement leaves the transaction open.
-    let (tx, done) = client.query_in(tx, Request::prepared(&MISSING, &[])).await;
-    assert!(matches!(done.result(), ResultSet::Error(_)));
+    let (tx, done) = client.query_in(tx, Request::new(&MISSING, &[])).await;
+    assert!(matches!(done.body(), Body::Error(_)));
     assert_eq!(count().await, before, "readers don't see uncommitted rows");
     client.commit(tx).await.unwrap();
     assert_eq!(count().await, before + 1);
@@ -201,8 +201,8 @@ async fn transactions() {
     drop(tx);
     let done = client.query(insert("gus")).await;
     assert!(matches!(
-        done.result(),
-        ResultSet::Command { changes: 1, .. }
+        done.body(),
+        Body::Command { changes: 1, .. }
     ));
     assert_eq!(count().await, before + 2, "fay rolled back, gus inserted");
 
@@ -210,7 +210,7 @@ async fn transactions() {
     let tx = client.begin_read().await.unwrap();
     assert_ne!(tx.id().connection(), 0, "read transactions run on a reader");
     let (tx, done) = client.query_in(tx, insert("hal")).await;
-    assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
+    assert!(matches!(done.body(), Body::Error(Error::Turso(_))));
     client.rollback(tx).await.unwrap();
 
     // A request naming a transaction that is over is refused, not run.
@@ -219,8 +219,8 @@ async fn transactions() {
     client.commit(tx).await.unwrap();
     let done = client.query(insert("ivy").in_transaction(id)).await;
     assert!(matches!(
-        done.result(),
-        ResultSet::Error(Error::TransactionEnded)
+        done.body(),
+        Body::Error(Error::TransactionEnded)
     ));
     assert_eq!(count().await, before + 2);
 
@@ -230,13 +230,13 @@ async fn transactions() {
     Sleep::during(TRANSACTION_TIMEOUT * 3).await;
     let (_tx, done) = client.query_in(tx, insert("kim")).await;
     assert!(matches!(
-        done.result(),
-        ResultSet::Error(Error::TransactionEnded)
+        done.body(),
+        Body::Error(Error::TransactionEnded)
     ));
     let done = client.query(insert("lu")).await;
     assert!(matches!(
-        done.result(),
-        ResultSet::Command { changes: 1, .. }
+        done.body(),
+        Body::Command { changes: 1, .. }
     ));
     assert_eq!(count().await, before + 3, "jo rolled back, lu inserted");
 }

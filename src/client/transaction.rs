@@ -2,7 +2,6 @@
 
 use slopio::runtime::send_msg_to_peer;
 
-use crate::shared::pending::Pending;
 use crate::shared::request::Request;
 use crate::shared::transaction::TransactionId;
 
@@ -45,6 +44,6 @@ impl Drop for TransactionToken {
         let rollback = Request::rollback().in_transaction(self.id);
         // Move-only: nobody keeps a clone and no slot is reserved, so the DB
         // thread finds nothing to wake and drops it when done.
-        send_msg_to_peer(self.db_thread, Pending::new(rollback));
+        send_msg_to_peer(self.db_thread, rollback);
     }
 }

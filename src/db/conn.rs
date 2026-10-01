@@ -4,7 +4,6 @@
 //! runs step by step and never blocks: [`Conn::step`] says what to wait for
 //! before stepping again.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZero;
 use std::ptr;
@@ -13,9 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::task::Waker;
 use std::time::Duration;
 
+use rustc_hash::FxHashMap;
 use turso_core::{Connection, LimboError, Statement as Prepared, StepResult};
 
-use crate::shared::request::{Error, Request};
+use crate::shared::request::{Body, Error};
 use crate::shared::statement::Statement;
 
 /// How many VM instructions run between two looks at the cancel flag.
@@ -37,8 +37,9 @@ pub(crate) enum Step {
 pub(crate) struct Conn {
     conn: Arc<Connection>,
     /// Keyed by [`Statement::key`]: requests' statements and the DB thread's
-    /// own alike, which never share a key.
-    statements: HashMap<usize, Prepared>,
+    /// own alike, which never share a key. The key is an address, not
+    /// untrusted input: a fast integer hash will do.
+    statements: FxHashMap<usize, Prepared>,
     /// Key of the statement in flight, if any.
     running: Option<usize>,
     /// The running request's cancel flag, set only for the duration of a step:
@@ -61,7 +62,7 @@ impl Conn {
         conn.set_progress_handler(CANCEL_CHECK_OPS, Some(Box::new(cancelled)));
         Conn {
             conn,
-            statements: HashMap::new(),
+            statements: FxHashMap::default(),
             running: None,
             cancel_flag,
             max_rows,
@@ -77,16 +78,16 @@ impl Conn {
         !self.conn.get_auto_commit()
     }
 
-    /// Prepares the request's statement on first use and binds its params.
-    pub(crate) fn start(&mut self, request: &mut Request) -> Step {
+    /// Prepares `statement` on first use and binds the arguments in `body`.
+    pub(crate) fn start(&mut self, statement: &'static Statement, body: &mut Body) -> Step {
         debug_assert!(self.is_idle(), "one request at a time");
-        match self.bind(request) {
+        match self.bind(statement, body) {
             Ok(()) => {
-                self.running = Some(request.statement().key());
+                self.running = Some(statement.key());
                 Step::Ready
             }
             Err(err) => {
-                request.set_error(Error::Turso(err));
+                body.set_error(Error::Turso(err));
                 Step::Done
             }
         }
@@ -96,9 +97,9 @@ impl Conn {
     ///
     /// Follows `sqlite3_stmt_readonly`, which counts `BEGIN` and `COMMIT` as
     /// read-only.
-    pub(crate) fn is_readonly(&mut self, request: &Request) -> Result<bool, LimboError> {
+    pub(crate) fn is_readonly(&mut self, statement: &'static Statement) -> Result<bool, LimboError> {
         Ok(self
-            .prepared(request.statement())?
+            .prepared(statement)?
             .get_program()
             .is_readonly())
     }
@@ -110,15 +111,16 @@ impl Conn {
         })
     }
 
-    fn bind(&mut self, request: &mut Request) -> Result<(), LimboError> {
-        let stmt = self.prepared(request.statement())?;
+    fn bind(&mut self, statement: &'static Statement, body: &mut Body) -> Result<(), LimboError> {
+        let stmt = self.prepared(statement)?;
         // Parameters left over from a previous run would otherwise leak in.
         stmt.clear_bindings();
-        for (index, param) in (1..).zip(request.params()) {
-            stmt.bind_at(NonZero::new(index).unwrap(), param.to_owned()?)?;
+        for (index, arg) in (1..).zip(body.args()) {
+            stmt.bind_at(NonZero::new(index).unwrap(), arg.to_owned()?)?;
         }
+        // The arguments are bound: their buffer can take the rows.
         if stmt.num_columns() > 0 {
-            request.begin_rows();
+            body.begin_rows();
         }
         Ok(())
     }
@@ -136,21 +138,21 @@ impl Conn {
     }
 
     /// Ends the running request with `err`, e.g. when the IO backend failed.
-    pub(crate) fn abort(&mut self, request: &mut Request, err: LimboError) {
+    pub(crate) fn abort(&mut self, body: &mut Body, err: LimboError) {
         if let Some(key) = self.running.take() {
             // The statement may be mid-IO, so this can block; the IO is broken anyway.
             let _ = self.statements.get_mut(&key).map(Prepared::reset);
         }
-        request.set_error(Error::Turso(err));
+        body.set_error(Error::Turso(err));
     }
 
-    /// Advances the running request once. `cancelled` is its `Pending`'s flag;
+    /// Advances the running request once. `cancelled` is its request's flag;
     /// once set, the step ends as `Cancelled` within a few instructions. On
     /// `Io`, turso wakes `waker` once the operation it waits on has finished —
     /// at once, if it already has.
     pub(crate) fn step(
         &mut self,
-        request: &mut Request,
+        body: &mut Body,
         cancelled: &AtomicBool,
         waker: &Waker,
     ) -> Step {
@@ -164,12 +166,12 @@ impl Conn {
         let stepped = stmt.step_with_waker(waker);
         self.cancel_flag.store(ptr::null_mut(), Ordering::Relaxed);
         let outcome = match stepped {
-            Ok(StepResult::Row) if request.row_count() >= Some(self.max_rows) => {
+            Ok(StepResult::Row) if body.row_count() >= Some(self.max_rows) => {
                 Err(Error::TooManyRows)
             }
             Ok(StepResult::Row) => {
                 let row = stmt.row().expect("row after StepResult::Row");
-                request.push_row(row.get_values());
+                body.push_row(row.get_values());
                 return Step::Ready;
             }
             Ok(StepResult::IO) => return Step::Io,
@@ -184,8 +186,8 @@ impl Conn {
         let reset = stmt.reset();
         self.running = None;
         match outcome.and_then(|done| reset.map(|()| done).map_err(Error::Turso)) {
-            Ok((changes, last_insert_rowid)) => request.finish_command(changes, last_insert_rowid),
-            Err(err) => request.set_error(err),
+            Ok((changes, last_insert_rowid)) => body.finish_command(changes, last_insert_rowid),
+            Err(err) => body.set_error(err),
         }
         Step::Done
     }
@@ -194,7 +196,7 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::request::ResultSet;
+    use crate::shared::request::Request;
     use turso_core::{Database, MemoryIO, Numeric, OpenOptions, SqliteDialect, Value, ValueRef};
 
     /// An in-memory database; `name` keeps tests apart in turso's registry.
@@ -206,13 +208,15 @@ mod tests {
     }
 
     /// Runs `request` to completion, blocking on IO.
-    fn run(conn: &mut Conn, mut request: Request) -> Request {
-        let mut step = conn.start(&mut request);
+    fn run(conn: &mut Conn, request: Request) -> Request {
+        // SAFETY: the test is the only holder.
+        let body = unsafe { request.body_mut() };
+        let mut step = conn.start(request.statement(), body);
         while step != Step::Done {
             if step == Step::Io {
                 conn.conn.get_pager().io.step().unwrap();
             }
-            step = conn.step(&mut request, &AtomicBool::new(false), Waker::noop());
+            step = conn.step(body, &AtomicBool::new(false), Waker::noop());
         }
         request
     }
@@ -227,14 +231,19 @@ mod tests {
     static ONE: Statement = Statement::new("SELECT 1");
 
     fn exec(conn: &mut Conn, statement: &'static Statement, params: &[ValueRef<'_>]) -> Request {
-        run(conn, Request::prepared(statement, params))
+        run(conn, Request::new(statement, params))
     }
 
-    fn int(value: &ValueRef<'_>) -> i64 {
+    fn int(value: ValueRef<'_>) -> i64 {
         match value {
-            ValueRef::Numeric(Numeric::Integer(i)) => *i,
+            ValueRef::Numeric(Numeric::Integer(i)) => i,
             other => panic!("not an integer: {other:?}"),
         }
+    }
+
+    /// Column `index` of the first row.
+    fn first(done: &Request, index: usize) -> ValueRef<'_> {
+        done.body().rows().next().unwrap().get(index).unwrap()
     }
 
     fn users(conn: &mut Conn) {
@@ -252,8 +261,12 @@ mod tests {
 
         let done = exec(&mut conn, &USERS_BY_ID, &[]);
         let rows: Vec<_> = done
-            .rows_iter()
-            .map(|row| (int(&row[0]), row[1].to_text().unwrap().to_owned()))
+            .body()
+            .rows()
+            .map(|row| {
+                let name = row.get(1).unwrap().to_text().unwrap().to_owned();
+                (int(row.get(0).unwrap()), name)
+            })
             .collect();
         assert_eq!(
             rows,
@@ -267,8 +280,8 @@ mod tests {
         users(&mut conn);
         let done = exec(&mut conn, &INSERT_USER, &[Value::from_text("dee").as_ref()]);
         assert!(matches!(
-            done.result(),
-            ResultSet::Command {
+            done.body(),
+            Body::Command {
                 changes: 1,
                 last_insert_rowid: 4
             }
@@ -283,14 +296,14 @@ mod tests {
         users(&mut conn);
 
         let done = exec(&mut conn, &MISSING, &[]);
-        assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
+        assert!(matches!(done.body(), Body::Error(Error::Turso(_))));
 
         let dup = Value::from_text("ada");
         let done = exec(&mut conn, &INSERT_USER, &[dup.as_ref()]);
-        assert!(matches!(done.result(), ResultSet::Error(Error::Turso(_))));
+        assert!(matches!(done.body(), Body::Error(Error::Turso(_))));
 
         let done = exec(&mut conn, &COUNT_USERS, &[]);
-        assert_eq!(int(&done.rows_iter().next().unwrap()[0]), 3);
+        assert_eq!(int(first(&done, 0)), 3);
     }
 
     #[test]
@@ -298,10 +311,7 @@ mod tests {
         let mut conn = open("row_limit", 2);
         users(&mut conn);
         let done = exec(&mut conn, &USER_NAMES, &[]);
-        assert!(matches!(
-            done.result(),
-            ResultSet::Error(Error::TooManyRows)
-        ));
+        assert!(matches!(done.body(), Body::Error(Error::TooManyRows)));
     }
 
     #[test]
@@ -311,20 +321,16 @@ mod tests {
         static COUNT_FOREVER: Statement = Statement::new(
             "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT count(*) FROM c",
         );
-        let mut request = Request::prepared(&COUNT_FOREVER, &[]);
-        conn.start(&mut request);
+        let request = Request::new(&COUNT_FOREVER, &[]);
+        // SAFETY: the test is the only holder.
+        let body = unsafe { request.body_mut() };
+        conn.start(request.statement(), body);
         let cancelled = AtomicBool::new(true);
-        assert_eq!(
-            conn.step(&mut request, &cancelled, Waker::noop()),
-            Step::Done
-        );
-        assert!(matches!(
-            request.result(),
-            ResultSet::Error(Error::Cancelled)
-        ));
+        assert_eq!(conn.step(body, &cancelled, Waker::noop()), Step::Done);
+        assert!(matches!(request.body(), Body::Error(Error::Cancelled)));
 
         // The interrupt does not leak into the next request.
         let done = exec(&mut conn, &ONE, &[]);
-        assert_eq!(int(&done.rows_iter().next().unwrap()[0]), 1);
+        assert_eq!(int(first(&done, 0)), 1);
     }
 }

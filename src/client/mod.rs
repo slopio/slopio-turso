@@ -2,9 +2,9 @@
 //! filled result.
 //!
 //! The request is shared, not handed over: this side keeps a clone of the
-//! `Arc<Message<Pending>>` in the awaiting future, so the DB thread's answer
+//! `Arc<Message<Request>>` in the awaiting future, so the DB thread's answer
 //! needs to carry nothing but a wakeup. The discipline that makes the sharing
-//! sound lives in [`crate::shared::pending`]; this module is one of its two halves.
+//! sound lives in [`crate::shared::request`]; this module is one of its two halves.
 
 pub mod query;
 mod transaction;
@@ -22,8 +22,7 @@ use slopio::runtime::{ReplySignal, send_shared_to_peer, thread_id};
 use turso_core::ValueRef;
 
 use crate::client::query::{Query, Rows};
-use crate::shared::pending::Pending;
-use crate::shared::request::{Error, Request, ResultSet};
+use crate::shared::request::{Body, Error, Request};
 
 /// A handle from a caller thread to the DB thread.
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +48,7 @@ impl Client {
     /// error it failed with. Rows are decoded here, on the caller's thread, as
     /// they are iterated.
     pub async fn query_typed<Q: Query>(&self, params: &[ValueRef<'_>]) -> Result<Rows<Q>, Error> {
-        Rows::new(self.query(Request::prepared(Q::STATEMENT, params)).await)
+        Rows::new(self.query(Request::new(Q::STATEMENT, params)).await)
     }
 
     /// Put `request` in flight and hand back the future awaiting its wakeup.
@@ -62,9 +61,9 @@ impl Client {
             Endpoint::with_slab(thread_id() as u16, signal.slot()),
             Endpoint::new(self.db_thread as u16),
         );
-        let msg = Message::with_header(header, Pending::new(request));
+        let msg = Message::with_header(header, request);
         // SAFETY: a clone survives here, so the payload really is shared; the
-        // handoff protocol in `crate::shared::pending` is what makes that sound — we
+        // handoff protocol in `crate::shared::request` is what makes that sound — we
         // touch nothing but the cancellation flag until the wakeup lands.
         unsafe { send_shared_to_peer(self.db_thread, Arc::clone(&msg)) };
         PendingQuery {
@@ -85,15 +84,15 @@ impl Client {
         self.begin(Request::begin_read()).await
     }
 
-    /// The DB thread stamps an id onto the reply only once the `BEGIN` actually
-    /// left the connection in a transaction, so a stamped id is proof it is
-    /// open. No id ⟹ nothing was opened, so no token exists and the filled
-    /// `Request` comes back in the `Err` for inspection.
+    /// The DB thread answers with an id only once the `BEGIN` actually left the
+    /// connection in a transaction, so an id is proof it is open. No id ⟹
+    /// nothing was opened, so no token exists and the filled `Request` comes
+    /// back in the `Err` for inspection.
     async fn begin(&self, request: Request) -> Result<TransactionToken, Request> {
         let done = self.query(request).await;
-        match done.transaction() {
-            Some(id) => Ok(TransactionToken::new(id, self.db_thread)),
-            None => Err(done),
+        match done.body() {
+            Body::Transaction(id) => Ok(TransactionToken::new(*id, self.db_thread)),
+            _ => Err(done),
         }
     }
 
@@ -131,7 +130,7 @@ impl Client {
     /// `ROLLBACK` — refused as ended if the transaction is already over.
     async fn end(&self, token: TransactionToken, request: Request) -> Result<Request, Request> {
         let done = self.query(request.in_transaction(token.id())).await;
-        if matches!(done.result(), ResultSet::Error(_)) {
+        if matches!(done.body(), Body::Error(_)) {
             Err(done)
         } else {
             // Disarm the token so its `Drop` doesn't post a spurious `ROLLBACK`.
@@ -148,7 +147,7 @@ impl Client {
 /// "abandoned", so there is no separate flag to arm and no disarm to forget.
 struct PendingQuery {
     signal: ReplySignal,
-    msg: Option<Arc<Message<Pending>>>,
+    msg: Option<Arc<Message<Request>>>,
 }
 
 impl Future for PendingQuery {
@@ -164,7 +163,7 @@ impl Future for PendingQuery {
         // The DB thread drops its clone before signalling (rule 4), so the
         // wakeup is proof ours is the last reference and nobody is still writing.
         Arc::into_inner(msg)
-            .map(|msg| Poll::Ready(msg.payload.into_request()))
+            .map(|msg| Poll::Ready(msg.payload))
             .expect("the DB thread released its clone before signalling")
     }
 }
@@ -174,7 +173,7 @@ impl Drop for PendingQuery {
     /// reserved until the late wakeup lands. Nothing is sent.
     fn drop(&mut self) {
         if let Some(msg) = &self.msg {
-            msg.payload.cancel();
+            msg.payload.meta().cancel();
         }
     }
 }

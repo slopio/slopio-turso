@@ -3,33 +3,35 @@
 //! Each query is a type implementing [`Query`]: its statement, and a
 //! concrete row type with a **non-panicking** mapping from the raw positional
 //! columns, built from the `get_*` helpers below. Decoding happens on the
-//! caller's thread, lazily as rows are iterated: the DB thread only fills the
-//! arena.
+//! caller's thread, lazily as rows are iterated: the DB thread only encodes
+//! them.
 //!
 //! The helpers take a row (`&[ValueRef]`) and a column index, and return a
 //! [`DecodeError`] on a shape or type mismatch instead of panicking. `&str` and
-//! `&[u8]` results borrow the arena (zero copy).
+//! `&[u8]` results borrow the encoded rows (zero copy).
 
 use std::fmt;
 use std::marker::PhantomData;
 
 use turso_core::{Numeric, ValueRef};
 
-use crate::shared::request::{Error, Request, ResultSet};
+use crate::shared::request::{Body, Error, Request};
 use crate::shared::statement::Statement;
 
 /// A statically-declared query: its identity, SQL, and row type + mapping.
 pub trait Query {
-    /// The concrete row type; borrows the arena (for `&str`/`&[u8]` fields).
+    /// The concrete row type; borrows the encoded rows (for `&str`/`&[u8]`
+    /// fields).
     type Row<'a>;
     /// Its statement, a `static`, with `?1..` placeholders.
     const STATEMENT: &'static Statement;
-    /// Map one row's positional columns into the row type. Never panics.
-    fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<Self::Row<'a>, DecodeError>;
+    /// Map one row's positional columns into the row type. Never panics. The
+    /// slice lives only for the call; the values borrow the encoded rows.
+    fn map<'a>(row: &[ValueRef<'a>]) -> Result<Self::Row<'a>, DecodeError>;
 }
 
-/// A completed query result, typed by its [`Query`]. Owns the arena its rows
-/// borrow from, so iterate it while it is alive.
+/// A completed query result, typed by its [`Query`]. Owns the encoded rows its
+/// typed rows borrow from, so iterate it while it is alive.
 pub struct Rows<Q: Query> {
     request: Request,
     _marker: PhantomData<fn() -> Q>,
@@ -38,7 +40,7 @@ pub struct Rows<Q: Query> {
 impl<Q: Query> Rows<Q> {
     /// A filled request, or the error it failed with.
     pub(crate) fn new(request: Request) -> Result<Self, Error> {
-        if let ResultSet::Error(err) = request.result() {
+        if let Body::Error(err) = request.body() {
             return Err(err.clone());
         }
         Ok(Rows {
@@ -48,13 +50,18 @@ impl<Q: Query> Rows<Q> {
     }
 
     /// Lazily decoded, each item a `Result` — decoding is fallible, never
-    /// panicking.
+    /// panicking. Each row is decoded into one buffer, reused for the next.
     pub fn iter(&self) -> impl Iterator<Item = Result<Q::Row<'_>, DecodeError>> {
-        self.request.rows_iter().map(|row| Q::map(row))
+        let mut values = Vec::new();
+        self.request.body().rows().map(move |row| {
+            values.clear();
+            values.extend(row.values());
+            Q::map(&values)
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.request.row_count().unwrap_or(0)
+        self.request.body().row_count().unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -187,7 +194,7 @@ pub fn get_bool(row: &[ValueRef<'_>], index: usize) -> Result<bool, DecodeError>
     }
 }
 
-/// Non-null `&str` at `index`, borrowing the arena.
+/// Non-null `&str` at `index`, borrowing the encoded rows.
 pub fn get_str<'a>(row: &[ValueRef<'a>], index: usize) -> Result<&'a str, DecodeError> {
     match get(row, index)? {
         ValueRef::Text(text) => Ok(text.value),
@@ -195,7 +202,7 @@ pub fn get_str<'a>(row: &[ValueRef<'a>], index: usize) -> Result<&'a str, Decode
     }
 }
 
-/// Non-null bytes at `index`, borrowing the arena.
+/// Non-null bytes at `index`, borrowing the encoded rows.
 pub fn get_blob<'a>(row: &[ValueRef<'a>], index: usize) -> Result<&'a [u8], DecodeError> {
     match get(row, index)? {
         ValueRef::Blob(bytes) => Ok(bytes),
@@ -246,7 +253,7 @@ mod tests {
     impl Query for User<'static> {
         type Row<'a> = User<'a>;
         const STATEMENT: &'static Statement = &USERS;
-        fn map<'a>(row: &'a [ValueRef<'a>]) -> Result<User<'a>, DecodeError> {
+        fn map<'a>(row: &[ValueRef<'a>]) -> Result<User<'a>, DecodeError> {
             Ok(User {
                 id: get_i64(row, 0)?,
                 name: get_str(row, 1)?,
@@ -261,12 +268,11 @@ mod tests {
 
     #[test]
     fn typed_rows_decode_positionally() {
-        let mut request = Request::prepared(User::STATEMENT, &[]);
-        request.begin_rows();
-        let ada = [int(1), Value::from_text("ada"), Value::from_text("ada@x")];
-        let bob = [int(2), Value::from_text("bob"), Value::Null];
-        request.push_row(ada.iter());
-        request.push_row(bob.iter());
+        let request = Request::new(User::STATEMENT, &[]);
+        // SAFETY: the test is the only holder.
+        let body = unsafe { request.body_mut() };
+        body.push_row(&[int(1), Value::from_text("ada"), Value::from_text("ada@x")]);
+        body.push_row(&[int(2), Value::from_text("bob"), Value::Null]);
 
         let rows = Rows::<User<'static>>::new(request).unwrap();
         assert_eq!(rows.len(), 2);
@@ -290,8 +296,9 @@ mod tests {
 
     #[test]
     fn a_failed_request_is_an_error() {
-        let mut request = Request::prepared(User::STATEMENT, &[]);
-        request.set_error(Error::TooManyRows);
+        let request = Request::new(User::STATEMENT, &[]);
+        // SAFETY: the test is the only holder.
+        unsafe { request.body_mut() }.set_error(Error::TooManyRows);
         assert!(matches!(
             Rows::<User<'static>>::new(request),
             Err(Error::TooManyRows)

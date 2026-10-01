@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bumpalo = { version = "3.20.3", features = ["collections"] }
 io-uring = "0.7.15"
 libc = "0.2"
-self_cell = "1.2.2"
-slopio = { package = "runtime", git = "ssh://git@github.com/slopio/slopio.git", branch = "main" }
+rustc-hash = "2.1"
+slopio = { package = "runtime", git = "ssh://git@github.com/slopio/slopio.git", branch = "topology-sqpoll" }
 turso_core = { version = "=0.8.1", default-features = false, features = ["fs", "json", "uuid", "io_uring"] }
+
+[dev-dependencies]
+crossbeam-queue = "0.3.14"

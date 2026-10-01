@@ -23,7 +23,7 @@ use slopio_turso::Client;
 use slopio_turso::RingIo;
 use slopio_turso::Statement;
 use slopio_turso::{Config, Server};
-use slopio_turso::{Request, ResultSet};
+use slopio_turso::{Body, Request};
 use turso_core::{Database, OpenOptions, SqliteDialect, Value, ValueRef};
 
 const DB_THREAD: usize = 0;
@@ -182,11 +182,11 @@ async fn client_thread(args: Args, thread: usize, stats: Arc<Mutex<Stats>>) {
                     let done = if read {
                         let id = (rng.next() % args.rows as u64) as i64 + 1;
                         let params = [ValueRef::from_i64(id)];
-                        client.query(Request::prepared(&GET_USER, &params)).await
+                        client.query(Request::new(&GET_USER, &params)).await
                     } else {
                         let name = Value::from_text(format!("new{}", rng.next() % 1_000_000));
                         client
-                            .query(Request::prepared(&INSERT_USER, &[name.as_ref()]))
+                            .query(Request::new(&INSERT_USER, &[name.as_ref()]))
                             .await
                     };
                     let elapsed = start.elapsed();
@@ -197,7 +197,7 @@ async fn client_thread(args: Args, thread: usize, stats: Arc<Mutex<Stats>>) {
                         &mut local.writes
                     };
                     samples.latencies.push(elapsed);
-                    if matches!(done.result(), ResultSet::Error(_)) {
+                    if matches!(done.body(), Body::Error(_)) {
                         samples.errors += 1;
                     }
                     drop(local);
