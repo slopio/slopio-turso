@@ -71,7 +71,7 @@ fn each_read_of_a_batch_gets_its_own_answer() {
     let db_path = path.clone();
     topology.dedicated::<(), _, _>(anywhere, move |_| async move {
         let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
-        match select(slopio_turso::db::serve(&db_path), stop).await {
+        match select(slopio_turso::db::serve(&db_path, Default::default()), stop).await {
             SelectResult::First(()) => unreachable!("serve never returns"),
             SelectResult::Second(SelectResult::First(_stop)) => {}
             SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),

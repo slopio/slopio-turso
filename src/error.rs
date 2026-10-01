@@ -2,7 +2,7 @@ use std::fmt;
 
 use turso_core::LimboError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     /// turso refused or failed the statement.
     Turso(LimboError),
@@ -12,6 +12,19 @@ pub enum Error {
     NoColumn(usize),
     /// `read_one` got more than one row.
     TooManyRows,
+    /// The write succeeded, but a later write of its batch failed and turso
+    /// rolled the whole transaction back.
+    RolledBack,
+}
+
+impl Error {
+    /// Another connection holds the lock this one needs.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Error::Turso(LimboError::Busy | LimboError::BusySnapshot)
+        )
+    }
 }
 
 impl From<LimboError> for Error {
@@ -32,6 +45,7 @@ impl fmt::Display for Error {
             }
             Error::NoColumn(index) => write!(f, "the row has no column {index}"),
             Error::TooManyRows => f.write_str("more than one row for read_one"),
+            Error::RolledBack => f.write_str("rolled back with its batch"),
         }
     }
 }

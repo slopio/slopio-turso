@@ -33,7 +33,7 @@ fn connect_twice(path: &str) -> (Connected, Connected) {
     let mut topology = Topology::new();
     let db_thread = topology.dedicated::<(), _, _>(anywhere, move |_| async move {
         let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
-        match select(slopio_turso::db::serve(&path), stop).await {
+        match select(slopio_turso::db::serve(&path, Default::default()), stop).await {
             SelectResult::First(()) => unreachable!("serve never returns"),
             SelectResult::Second(SelectResult::First(_stop)) => {}
             SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),

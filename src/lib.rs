@@ -5,11 +5,15 @@
 //! them. Writes cross to the one writer, which batches them into few commits.
 
 mod client;
+mod conn;
 pub mod db;
 mod error;
 mod reader;
+mod request;
 mod row;
 pub mod statement;
+mod timer;
+mod writer;
 
 pub use client::Client;
 pub use error::Error;
