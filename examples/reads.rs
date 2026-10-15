@@ -183,7 +183,7 @@ async fn work(client: Client, seed: u64, deadline: Instant, writes: u64) -> Tall
         } else {
             let start = Instant::now();
             let user: User = client
-                .read_one(&GET_USER, vec![id_param])
+                .read_one(&GET_USER, [id_param])
                 .await
                 .unwrap()
                 .unwrap();

@@ -18,29 +18,47 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use turso_core::Value;
-
-use crate::Error;
-use crate::conn::{Answer, Conn, Decode};
+use crate::conn::{Conn, Decode};
 use crate::db::Shared;
+use crate::{Error, Params};
 
 /// The most reads one read transaction serves.
 const MAX_BATCH: usize = 64;
 
-/// A read waiting for the reader, shared by it and the task that asked.
-struct Slot {
+/// A read waiting for the reader, shared by it and the task that asked; its
+/// rows are decoded into an `R`.
+struct Slot<R, P> {
     /// The statement's key in the reader's cache, and its SQL.
     key: usize,
     sql: &'static str,
-    params: Cell<Vec<Value>>,
-    decode: Decode,
-    result: Cell<Option<Answer>>,
+    /// Taken by the reader.
+    params: Cell<Option<P>>,
+    decode: Decode<R>,
+    result: Cell<Option<Result<R, Error>>>,
     /// The task that asked, while it sleeps.
     waker: Cell<Option<Waker>>,
 }
 
+/// A queued read, whatever its rows decode into.
+trait Job {
+    /// Runs the read on `conn`, leaves its answer in the slot and wakes the
+    /// task that asked.
+    fn run(&self, conn: &mut Conn);
+}
+
+impl<R, P: Params> Job for Slot<R, P> {
+    fn run(&self, conn: &mut Conn) {
+        let params = self.params.take().expect("a read runs once");
+        let answer = conn.run(self.key, self.sql, params, self.decode);
+        self.result.set(Some(answer));
+        if let Some(task) = self.waker.take() {
+            task.wake();
+        }
+    }
+}
+
 pub(crate) struct Queue {
-    slots: RefCell<VecDeque<Rc<Slot>>>,
+    slots: RefCell<VecDeque<Rc<dyn Job>>>,
     /// The reader, while it sleeps on an empty queue.
     reader: Cell<Option<Waker>>,
 }
@@ -58,21 +76,20 @@ impl Queue {
         &self,
         key: usize,
         sql: &'static str,
-        params: Vec<Value>,
-        decode: Decode,
+        params: impl Params,
+        decode: Decode<R>,
     ) -> Result<R, Error> {
         let slot = Rc::new(Slot {
             key,
             sql,
-            params: Cell::new(params),
+            params: Cell::new(Some(params)),
             decode,
             result: Cell::new(None),
             waker: Cell::new(None),
         });
         self.slots.borrow_mut().push_back(slot.clone());
         self.wake_reader();
-        let answer = Done(slot).await?;
-        Ok(*answer.downcast().expect("`decode` answers with an `R`"))
+        Done(slot).await
     }
 
     pub(crate) fn wake_reader(&self) {
@@ -83,7 +100,7 @@ impl Queue {
 
     /// Moves up to [`MAX_BATCH`] reads into `batch`, waiting for one if the
     /// queue is empty. False once no client is left to queue any.
-    async fn next_batch(self: &Rc<Self>, batch: &mut Vec<Rc<Slot>>) -> bool {
+    async fn next_batch(self: &Rc<Self>, batch: &mut Vec<Rc<dyn Job>>) -> bool {
         poll_fn(|cx| {
             let mut slots = self.slots.borrow_mut();
             if slots.is_empty() {
@@ -103,12 +120,12 @@ impl Queue {
 }
 
 /// Resolves once the reader has put the answer in the slot.
-struct Done(Rc<Slot>);
+struct Done<R, P>(Rc<Slot<R, P>>);
 
-impl Future for Done {
-    type Output = Answer;
+impl<R, P> Future for Done<R, P> {
+    type Output = Result<R, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Answer> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.0.result.take() {
             Some(answer) => Poll::Ready(answer),
             None => {
@@ -132,11 +149,7 @@ pub(crate) async fn run(mut conn: Conn, queue: Rc<Queue>, shared: Arc<Shared>) {
             if Rc::strong_count(&slot) == 1 {
                 continue;
             }
-            let answer = conn.run(slot.key, slot.sql, slot.params.take(), slot.decode);
-            slot.result.set(Some(answer));
-            if let Some(task) = slot.waker.take() {
-                task.wake();
-            }
+            slot.run(&mut conn);
         }
         // Never keep an old snapshot open.
         if in_tx && conn.in_transaction() {

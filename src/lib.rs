@@ -17,7 +17,7 @@ pub mod statement;
 mod timer;
 mod writer;
 
-pub use client::Client;
+pub use client::{Client, Params};
 pub use error::Error;
 pub use row::{FromRow, Row};
 pub use statement::{Read, Write};

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 io-uring = "0.7.15"
+rustc-hash = "2.1"
 slopio = { package = "runtime", git = "ssh://git@github.com/slopio/slopio.git", branch = "main" }
 turso_core = { version = "=0.8.1", default-features = false, features = ["fs", "json", "uuid", "io_uring", "conn_raw_api"] }
 

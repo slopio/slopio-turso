@@ -12,6 +12,12 @@ use crate::request::{self, Body};
 use crate::row::FromRow;
 use crate::{Error, Read, Write};
 
+/// A statement's parameters, in order: a `Vec<Value>`, or an array
+/// `[Value; N]`, which a read keeps without allocating.
+pub trait Params: IntoIterator<Item = Value, IntoIter: ExactSizeIterator> + 'static {}
+
+impl<P> Params for P where P: IntoIterator<Item = Value, IntoIter: ExactSizeIterator> + 'static {}
+
 /// A worker's handle on the database. Clone it for every task of the worker
 /// that uses it; it cannot leave the worker.
 ///
@@ -60,7 +66,7 @@ impl Client {
     pub async fn read<T: FromRow>(
         &self,
         statement: &'static Read,
-        params: Vec<Value>,
+        params: impl Params,
     ) -> Result<Vec<T>, Error> {
         self.reads
             .read(statement.key(), statement.sql(), params, conn::all::<T>)
@@ -72,7 +78,7 @@ impl Client {
     pub async fn read_one<T: FromRow>(
         &self,
         statement: &'static Read,
-        params: Vec<Value>,
+        params: impl Params,
     ) -> Result<Option<T>, Error> {
         self.reads
             .read(statement.key(), statement.sql(), params, conn::one::<T>)

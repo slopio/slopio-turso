@@ -279,13 +279,13 @@ async fn request(client: &Client, kind: Kind, user: i64, due: Instant, work: Dur
     let now = || Value::Numeric(Numeric::Integer(due.elapsed().as_nanos() as i64));
     match kind {
         Kind::Profile => {
-            let found: Option<User> = client.read_one(&GET_USER, vec![id()]).await.unwrap();
+            let found: Option<User> = client.read_one(&GET_USER, [id()]).await.unwrap();
             assert!(found.is_some());
-            let posts: Vec<Post> = client.read(&USER_POSTS, vec![id()]).await.unwrap();
+            let posts: Vec<Post> = client.read(&USER_POSTS, [id()]).await.unwrap();
             assert!(posts.len() <= 20);
         }
         Kind::Feed => {
-            let posts: Vec<Post> = client.read(&RECENT_POSTS, vec![]).await.unwrap();
+            let posts: Vec<Post> = client.read(&RECENT_POSTS, []).await.unwrap();
             assert_eq!(posts.len(), 20);
         }
         Kind::Post => {

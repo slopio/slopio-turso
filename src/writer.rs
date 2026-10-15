@@ -134,7 +134,6 @@ impl Writer {
         let (statement, params) = (*statement, mem::take(params));
         self.conn
             .run(statement.key(), statement.sql(), params, conn::none)
-            .map(drop)
     }
 
     /// The held writes that had succeeded are undone: they get `error`.

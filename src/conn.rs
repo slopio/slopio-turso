@@ -1,23 +1,20 @@
 //! One turso connection, driven to completion on the thread that owns it: the
 //! worker's reader, or the DB thread's writer.
 
-use std::any::Any;
-use std::collections::hash_map::{Entry, HashMap};
+use std::collections::hash_map::Entry;
 use std::num::NonZero;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use turso_core::{
-    CheckpointMode, Connection, Database, IO, LimboError, Statement, StepResult, SyncMode, Value,
+    CheckpointMode, Connection, Database, IO, LimboError, Statement, StepResult, SyncMode,
 };
 
-use crate::Error;
 use crate::row::{FromRow, Row};
+use crate::{Error, Params};
 
-/// A statement's decoded rows, their type erased.
-pub(crate) type Answer = Result<Box<dyn Any>, Error>;
-
-/// Steps a bound statement to its end, decoding its rows into an [`Answer`].
-pub(crate) type Decode = fn(&mut Statement, &Arc<dyn IO>) -> Answer;
+/// Steps a bound statement to its end, decoding its rows into an `R`.
+pub(crate) type Decode<R> = fn(&mut Statement, &Arc<dyn IO>) -> Result<R, Error>;
 
 pub(crate) struct Conn {
     conn: Arc<Connection>,
@@ -25,8 +22,9 @@ pub(crate) struct Conn {
     begin: Statement,
     commit: Statement,
     rollback: Statement,
-    /// The clients' statements, by the address of their `static`.
-    statements: HashMap<usize, Statement>,
+    /// The clients' statements, by the address of their `static`: a fast
+    /// hash, as the keys come from our own statics.
+    statements: FxHashMap<usize, Statement>,
 }
 
 impl Conn {
@@ -38,7 +36,7 @@ impl Conn {
             commit: conn.prepare("COMMIT")?,
             rollback: conn.prepare("ROLLBACK")?,
             io: db.io.clone(),
-            statements: HashMap::new(),
+            statements: FxHashMap::default(),
             conn,
         })
     }
@@ -97,13 +95,13 @@ impl Conn {
 
     /// Runs the statement `sql`, prepared once and cached under `key`, with
     /// `params`; `decode` turns its rows into the answer.
-    pub(crate) fn run(
+    pub(crate) fn run<R>(
         &mut self,
         key: usize,
         sql: &'static str,
-        params: Vec<Value>,
-        decode: Decode,
-    ) -> Answer {
+        params: impl Params,
+        decode: Decode<R>,
+    ) -> Result<R, Error> {
         let stmt = match self.statements.entry(key) {
             Entry::Occupied(prepared) => prepared.into_mut(),
             Entry::Vacant(entry) => entry.insert(self.conn.prepare(sql)?),
@@ -115,17 +113,17 @@ impl Conn {
 }
 
 /// Every row, as a `Vec<T>`.
-pub(crate) fn all<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Answer {
+pub(crate) fn all<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<Vec<T>, Error> {
     let mut rows = Vec::<T>::new();
     for_each_row(stmt, io, |row| {
         rows.push(T::from_row(&row)?);
         Ok(())
     })?;
-    Ok(Box::new(rows))
+    Ok(rows)
 }
 
 /// The row if there is one, as an `Option<T>`; more than one is an error.
-pub(crate) fn one<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Answer {
+pub(crate) fn one<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<Option<T>, Error> {
     let mut first = None::<T>;
     for_each_row(stmt, io, |row| {
         if first.is_some() {
@@ -134,18 +132,18 @@ pub(crate) fn one<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Answer 
         first = Some(T::from_row(&row)?);
         Ok(())
     })?;
-    Ok(Box::new(first))
+    Ok(first)
 }
 
 /// No rows wanted: `()`.
-pub(crate) fn none(stmt: &mut Statement, io: &Arc<dyn IO>) -> Answer {
-    for_each_row(stmt, io, |_| Ok(()))?;
-    Ok(Box::new(()))
+pub(crate) fn none(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<(), Error> {
+    for_each_row(stmt, io, |_| Ok(()))
 }
 
 /// Binds every parameter: `reset` keeps the previous values, so one left out
 /// would silently be the last run's.
-fn bind(stmt: &mut Statement, params: Vec<Value>) -> Result<(), Error> {
+fn bind(stmt: &mut Statement, params: impl Params) -> Result<(), Error> {
+    let params = params.into_iter();
     let expected = stmt.parameters_count();
     if params.len() != expected {
         return Err(Error::Parameters {
@@ -153,7 +151,7 @@ fn bind(stmt: &mut Statement, params: Vec<Value>) -> Result<(), Error> {
             given: params.len(),
         });
     }
-    for (i, param) in params.into_iter().enumerate() {
+    for (i, param) in params.enumerate() {
         stmt.bind_at(NonZero::new(i + 1).unwrap(), param)?;
     }
     Ok(())

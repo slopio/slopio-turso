@@ -1537,6 +1537,7 @@ dependencies = [
  "io-uring",
  "runtime",
  "rusqlite",
+ "rustc-hash",
  "turso_core",
 ]
 
