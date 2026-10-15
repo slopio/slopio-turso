@@ -28,8 +28,18 @@ pub struct Client {
 impl Client {
     /// Asks the DB thread `db_thread` for the database, waiting for it to be
     /// open if it is not yet, and starts this worker's reader task.
-    pub async fn connect(db_thread: usize) -> Result<Client, Error> {
-        let Body::Opened(db) = request::send(db_thread, Body::Connect).await else {
+    ///
+    /// # Safety
+    ///
+    /// `db_thread` must be a thread whose root future is [`db::serve`]: the
+    /// request crosses with its type erased, and any other receiver would
+    /// take it for whatever type it expects.
+    ///
+    /// [`db::serve`]: crate::db::serve
+    pub async unsafe fn connect(db_thread: usize) -> Result<Client, Error> {
+        // SAFETY: the caller vouches that `db_thread` runs `serve`.
+        let connected = unsafe { request::send(db_thread, Body::Connect) };
+        let Body::Opened(db) = connected.await else {
             unreachable!("a `Connect` is answered with `Opened`");
         };
         let shared = db?;

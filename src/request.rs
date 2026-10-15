@@ -103,10 +103,16 @@ pub(crate) fn reply(msg: Msg, body: Body) {
 
 /// Sends `body` to the DB thread `db_thread` over MSG_RING and waits for its
 /// answer.
-pub(crate) async fn send(db_thread: usize, body: Body) -> Body {
+///
+/// # Safety
+///
+/// `db_thread` must run [`serve`](crate::db::serve): only it receives a
+/// `Request`.
+pub(crate) async unsafe fn send(db_thread: usize, body: Body) -> Body {
     let (signal, msg) = request(db_thread, body);
     // SAFETY: we keep a clone, but touch nothing but the cancellation flag
-    // until the wakeup, by which time the DB thread has dropped its own.
+    // until the wakeup, by which time the DB thread has dropped its own; and
+    // the caller vouches that `db_thread` expects a `Request`.
     unsafe { send_shared_to_peer(db_thread, Arc::clone(&msg)) };
     answer(signal, msg).await
 }
@@ -127,7 +133,8 @@ fn request(db_thread: usize, body: Body) -> (ReplySignal, Msg) {
     let signal = ReplySignal::reserve();
     let header = Header::new(
         Endpoint::with_slab(thread_id() as u16, signal.slot()),
-        Endpoint::new(db_thread as u16),
+        // Truncated, it would name another thread.
+        Endpoint::new(u16::try_from(db_thread).expect("no such thread")),
     );
     (signal, Message::with_header(header, Request::new(body)))
 }

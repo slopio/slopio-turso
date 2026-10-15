@@ -58,7 +58,9 @@ fn connect_twice(path: &str) -> (Connected, Connected) {
 }
 
 async fn connect() -> Connected {
-    match select(Client::connect(DB_THREAD), Sleep::during(TIMEOUT)).await {
+    // SAFETY: the first group, thread DB_THREAD, runs `serve`.
+    let connect = unsafe { Client::connect(DB_THREAD) };
+    match select(connect, Sleep::during(TIMEOUT)).await {
         SelectResult::First(client) => client.map(|c| c.database().clone()),
         SelectResult::Second(()) => panic!("client: timed out"),
     }

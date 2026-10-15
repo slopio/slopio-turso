@@ -65,7 +65,8 @@ fn every_write_is_answered_with_what_happened() {
     topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
         let tx = tx.clone();
         async move {
-            let client = Client::connect(DB_THREAD).await.unwrap();
+            // SAFETY: the first group, thread DB_THREAD, runs `serve`.
+            let client = unsafe { Client::connect(DB_THREAD) }.await.unwrap();
             let work = async {
                 // A write, then a read of it from the same task.
                 let name = Value::build_text("alice");

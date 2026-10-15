@@ -86,7 +86,8 @@ fn each_read_of_a_batch_gets_its_own_answer() {
     topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
         let tx = tx.clone();
         async move {
-            let client = Client::connect(DB_THREAD).await.unwrap();
+            // SAFETY: the first group, thread DB_THREAD, runs `serve`.
+            let client = unsafe { Client::connect(DB_THREAD) }.await.unwrap();
             // Every read is spawned before any runs: they reach the reader together.
             let c = client.clone();
             let one = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(2)).await });

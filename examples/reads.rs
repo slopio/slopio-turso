@@ -105,7 +105,8 @@ fn main() {
     topology.group::<(), _, _>(Threads::Auto(args.workers), ring, move |ctx| {
         let tx = tx.clone();
         async move {
-            let client = Client::connect(db_thread).await.unwrap();
+            // SAFETY: `db_thread` is the group that runs `serve`.
+            let client = unsafe { Client::connect(db_thread) }.await.unwrap();
             let deadline = Instant::now() + Duration::from_secs(seconds);
             let handles: Vec<_> = (0..tasks)
                 .map(|t| {
