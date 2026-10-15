@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release --example reads -- [--workers 3] [--tasks 64] [--seconds 5] [--writes 0] [--split 0]
-//!     [--synchronous full|normal] [--interval-us 0] [--wal-limit 16000]
+//!     [--synchronous full|normal] [--interval-us 2000] [--wal-limit 16000]
 //! ```
 //!
 //! `--split 1`: instead of every task writing `--writes` percent of the time,

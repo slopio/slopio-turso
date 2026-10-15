@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --example app -- [--workers 3] [--rates 50000,100000] [--seconds 3]
-//!     [--work-us 5] [--writes 15] [--synchronous full|normal] [--interval-us 0] [--wal-limit 16000]
+//!     [--work-us 5] [--writes 15] [--synchronous full|normal] [--interval-us 2000] [--wal-limit 16000]
 //! ```
 //!
 //! The data: 100k users, 300k posts indexed by author. Users are not equally
@@ -386,10 +386,7 @@ fn parse_args() -> Args {
         seconds: 3,
         work: Duration::from_micros(5),
         writes: 15,
-        config: Config {
-            synchronous: Synchronous::Normal,
-            ..Config::default()
-        },
+        config: Config::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {

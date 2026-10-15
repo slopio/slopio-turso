@@ -43,7 +43,10 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             synchronous: Synchronous::default(),
-            commit_interval: Duration::ZERO,
+            // Under load (app.rs, 8 workers, 250k requests/s), a commit each
+            // 2 ms instead of each drained inbox takes reads from about 3 ms
+            // to 1 ms at the median; writes, then at about 9 ms, barely move.
+            commit_interval: Duration::from_millis(2),
             // About 64 MB of 4 KiB pages: rare enough to cost nearly nothing.
             wal_limit: 16_000,
         }
@@ -64,10 +67,11 @@ pub(crate) struct Shared {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Synchronous {
     /// Every commit waits for an fsync of the WAL: nothing is lost.
-    #[default]
     Full,
     /// Only checkpoints fsync: a crash of the process loses nothing, a power
-    /// loss may lose the last commits but never corrupts the database.
+    /// loss may lose the last commits but never corrupts the database. The
+    /// default: writes answer in about 0.15 ms instead of 2.7 ms.
+    #[default]
     Normal,
 }
 
