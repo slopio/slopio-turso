@@ -125,7 +125,7 @@ checksum = "bfdc70193dadb9d7287fa4b633f15f90c876915b31f6af17da307fc59c9859a8"
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio.git?branch=topology-sqpoll#da7a630582b45fe568a2bec6d27a3ae0c4da5ab1"
+source = "git+ssh://git@github.com/slopio/slopio.git?branch=main#7efc3894762dfda66fdd122775f588d53b6a160b"
 
 [[package]]
 name = "autocfg"
@@ -776,7 +776,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio.git?branch=topology-sqpoll#da7a630582b45fe568a2bec6d27a3ae0c4da5ab1"
+source = "git+ssh://git@github.com/slopio/slopio.git?branch=main#7efc3894762dfda66fdd122775f588d53b6a160b"
 dependencies = [
  "io-uring",
  "rustix",
@@ -1315,7 +1315,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio.git?branch=topology-sqpoll#da7a630582b45fe568a2bec6d27a3ae0c4da5ab1"
+source = "git+ssh://git@github.com/slopio/slopio.git?branch=main#7efc3894762dfda66fdd122775f588d53b6a160b"
 dependencies = [
  "libc",
  "mimalloc",
@@ -1325,7 +1325,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio.git?branch=topology-sqpoll#da7a630582b45fe568a2bec6d27a3ae0c4da5ab1"
+source = "git+ssh://git@github.com/slopio/slopio.git?branch=main#7efc3894762dfda66fdd122775f588d53b6a160b"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -1344,7 +1344,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio.git?branch=topology-sqpoll#da7a630582b45fe568a2bec6d27a3ae0c4da5ab1"
+source = "git+ssh://git@github.com/slopio/slopio.git?branch=main#7efc3894762dfda66fdd122775f588d53b6a160b"
 
 [[package]]
 name = "rusqlite"
