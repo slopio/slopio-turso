@@ -10,14 +10,14 @@ use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::{RingOptions, Threads, Topology};
-use slopio_turso::{Client, Error, FromRow, Read, Row, Write};
+use slopio_turso::{Client, Error, FromRow, Read, Row, Write, read_sql, write_sql};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
 const DB_THREAD: usize = 0;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-static INSERT_USER: Write = Write::new("INSERT INTO users (id, name) VALUES (?1, ?2)");
-static GET_USER: Read = Read::new("SELECT id, name FROM users WHERE id = ?1");
+static INSERT_USER: Write = write_sql!("INSERT INTO users (id, name) VALUES (?1, ?2)");
+static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
 
 #[derive(Debug, PartialEq)]
 struct User {

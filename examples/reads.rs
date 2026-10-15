@@ -23,7 +23,7 @@ use slopio::runtime::select::select;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::db::{Config, Synchronous};
-use slopio_turso::{Client, Error, FromRow, Read, Row, Write};
+use slopio_turso::{Client, Error, FromRow, Read, Row, Write, read_sql, write_sql};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
 const PATH: &str = "/tmp/slopio-turso-reads.db";
@@ -31,8 +31,8 @@ const ROWS: u64 = 100_000;
 /// One read in this many has its latency recorded.
 const READ_SAMPLE: u64 = 64;
 
-static GET_USER: Read = Read::new("SELECT id, name FROM users WHERE id = ?1");
-static RENAME_USER: Write = Write::new("UPDATE users SET name = ?2 WHERE id = ?1");
+static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static RENAME_USER: Write = write_sql!("UPDATE users SET name = ?2 WHERE id = ?1");
 
 struct User {
     id: i64,

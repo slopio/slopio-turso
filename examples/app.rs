@@ -30,7 +30,7 @@ use slopio::runtime::select::select;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::{RingOptions, Threads, Topology};
 use slopio_turso::db::{Config, Synchronous};
-use slopio_turso::{Client, Error, FromRow, Read, Row, Write};
+use slopio_turso::{Client, Error, FromRow, Read, Row, Write, read_sql, write_sql};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
 const PATH: &str = "/tmp/slopio-turso-app.db";
@@ -40,15 +40,15 @@ const POSTS: u64 = 300_000;
 /// server would rather than queue without end.
 const MAX_IN_FLIGHT: usize = 10_000;
 
-static GET_USER: Read = Read::new("SELECT id, name, email, last_seen FROM users WHERE id = ?1");
-static USER_POSTS: Read = Read::new(
+static GET_USER: Read = read_sql!("SELECT id, name, email, last_seen FROM users WHERE id = ?1");
+static USER_POSTS: Read = read_sql!(
     "SELECT id, user_id, created_at, body FROM posts WHERE user_id = ?1 ORDER BY id DESC LIMIT 20",
 );
 static RECENT_POSTS: Read =
-    Read::new("SELECT id, user_id, created_at, body FROM posts ORDER BY id DESC LIMIT 20");
+    read_sql!("SELECT id, user_id, created_at, body FROM posts ORDER BY id DESC LIMIT 20");
 static NEW_POST: Write =
-    Write::new("INSERT INTO posts (user_id, created_at, body) VALUES (?1, ?2, ?3)");
-static SEEN: Write = Write::new("UPDATE users SET last_seen = ?2 WHERE id = ?1");
+    write_sql!("INSERT INTO posts (user_id, created_at, body) VALUES (?1, ?2, ?3)");
+static SEEN: Write = write_sql!("UPDATE users SET last_seen = ?2 WHERE id = ?1");
 
 #[allow(dead_code)]
 struct User {

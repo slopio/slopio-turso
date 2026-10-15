@@ -34,6 +34,8 @@ impl Client {
         };
         let shared = db?;
         let conn = Conn::new(&shared.db, "BEGIN")?;
+        // A `WITH … INSERT` passes for a `Read`: only turso can tell it writes.
+        conn.set_query_only();
         let reads = Rc::new(Queue::new());
         slopio::spawn(reader::run(conn, reads.clone(), shared.clone()));
         Ok(Client {

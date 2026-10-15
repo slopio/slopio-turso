@@ -9,16 +9,18 @@ use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
 use slopio::runtime::{recv_from_peer, send_to_peer};
 use slopio::{RingOptions, Threads, Topology};
-use slopio_turso::{Client, Error, FromRow, Read, Row};
+use slopio_turso::{Client, Error, FromRow, Read, Row, read_sql};
 use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 
 const DB_THREAD: usize = 0;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-static GET_USER: Read = Read::new("SELECT id, name FROM users WHERE id = ?1");
-static ALL_USERS: Read = Read::new("SELECT id, name FROM users ORDER BY id");
-static MISSING: Read = Read::new("SELECT * FROM missing");
-static BAD_JSON: Read = Read::new("SELECT json_extract('{oops', '$'), 'x'");
+static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static ALL_USERS: Read = read_sql!("SELECT id, name FROM users ORDER BY id");
+static MISSING: Read = read_sql!("SELECT * FROM missing");
+static BAD_JSON: Read = read_sql!("SELECT json_extract('{oops', '$'), 'x'");
+/// Reads like a `SELECT` up to its `INSERT`.
+static SNEAKY: Read = read_sql!("WITH x AS (SELECT 4, 'd') INSERT INTO users SELECT * FROM x");
 
 #[derive(Debug, PartialEq)]
 struct User {
@@ -110,7 +112,12 @@ fn each_read_of_a_batch_gets_its_own_answer() {
             let c = client.clone();
             let bad_json = slopio::spawn(async move { c.read::<User>(&BAD_JSON, vec![]).await });
             let c = client.clone();
+            let sneaky = slopio::spawn(async move { c.read::<User>(&SNEAKY, vec![]).await });
+            let c = client.clone();
             let after = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(3)).await });
+            let c = client.clone();
+            let not_written =
+                slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(4)).await });
 
             let work = async {
                 let one = one.await.unwrap();
@@ -138,9 +145,12 @@ fn each_read_of_a_batch_gets_its_own_answer() {
                 assert!(matches!(no_column.await, Err(Error::NoColumn(2))));
                 assert!(matches!(missing.await, Err(Error::Turso(_))));
                 assert!(matches!(bad_json.await, Err(Error::Turso(_))));
+                // The read connection is query-only: a `Read` cannot write.
+                assert!(matches!(sneaky.await, Err(Error::Turso(_))));
                 // turso rolled back the shared transaction on that error; the rest
                 // of the batch still reads.
                 assert_eq!(after.await.unwrap(), Some(user(3, "c")));
+                assert_eq!(not_written.await.unwrap(), None);
             };
             let finished = matches!(
                 select(work, Sleep::during(TIMEOUT)).await,

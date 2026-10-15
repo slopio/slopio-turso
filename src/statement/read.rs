@@ -10,10 +10,12 @@ pub struct Read {
 }
 
 impl Read {
-    /// Panics — a compile error when defining a `static` — on `PRAGMA`,
-    /// `ATTACH`, `DETACH`, `VACUUM … INTO`, transaction control, and statements
-    /// whose first keyword writes.
-    pub const fn new(sql: &'static str) -> Self {
+    /// For [`read_sql!`](crate::read_sql), which runs it at compile time.
+    ///
+    /// Panics on `PRAGMA`, `ATTACH`, `DETACH`, `VACUUM … INTO`, transaction
+    /// control, and statements whose first keyword writes.
+    #[doc(hidden)]
+    pub const fn __new(sql: &'static str) -> Self {
         match classify(sql) {
             Kind::Read | Kind::Unknown => Read { sql },
             Kind::Write => panic!("this statement writes: declare it as a `Write`"),

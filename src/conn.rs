@@ -47,6 +47,11 @@ impl Conn {
         self.conn.set_sync_mode(mode);
     }
 
+    /// Refuses, as it prepares them, the statements that would write.
+    pub(crate) fn set_query_only(&self) {
+        self.conn.set_query_only(true);
+    }
+
     /// The WAL's size, in pages.
     pub(crate) fn wal_pages(&self) -> Result<u64, Error> {
         Ok(self.conn.wal_state()?.max_frame)
