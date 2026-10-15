@@ -88,10 +88,26 @@ impl Client {
     /// Sends `statement` with `params` to the DB thread's writer, and answers
     /// once its batch has committed.
     pub async fn write(&self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
-        let body = Body::Write { statement, params };
+        self.push(Body::Write { statement, params }).await
+    }
+
+    /// Sends `writes` to the DB thread's writer, to run in order and commit
+    /// together or not at all, and answers once their batch has committed.
+    /// The first write that fails undoes the others and is the answer.
+    pub async fn transaction(
+        &self,
+        writes: Vec<(&'static Write, Vec<Value>)>,
+    ) -> Result<(), Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.push(Body::Transaction { writes }).await
+    }
+
+    async fn push(&self, body: Body) -> Result<(), Error> {
         let Body::Written(written) = request::push(self.db_thread, &self.shared.writes, body).await
         else {
-            unreachable!("a `Write` is answered with `Written`");
+            unreachable!("a write is answered with `Written`");
         };
         written
     }

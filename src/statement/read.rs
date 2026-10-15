@@ -20,7 +20,7 @@ impl Read {
             Kind::Read | Kind::Unknown => Read { sql },
             Kind::Write => panic!("this statement writes: declare it as a `Write`"),
             Kind::Transaction => {
-                panic!("transactions are opened and ended through the transaction API")
+                panic!("run writes together with `Client::transaction`")
             }
             Kind::Forbidden => panic!(
                 "PRAGMA, ATTACH, DETACH and VACUUM INTO statements could reconfigure the \

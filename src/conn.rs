@@ -81,10 +81,28 @@ impl Conn {
     /// open.
     pub(crate) fn commit(&mut self) -> Result<(), Error> {
         let committed = execute(&mut self.commit, &self.io);
-        if committed.is_err() && self.in_transaction() {
-            let _ = execute(&mut self.rollback, &self.io);
+        if committed.is_err() {
+            self.rollback();
         }
         committed
+    }
+
+    /// Undoes the open transaction, if any.
+    pub(crate) fn rollback(&mut self) {
+        if self.in_transaction() {
+            let _ = execute(&mut self.rollback, &self.io);
+        }
+    }
+
+    /// Prepares `sql`, one of the statements the crate runs itself.
+    pub(crate) fn prepare(&self, sql: &str) -> Result<Statement, Error> {
+        Ok(self.conn.prepare(sql)?)
+    }
+
+    /// Runs `stmt`, prepared by [`prepare`](Self::prepare): no parameters,
+    /// no rows.
+    pub(crate) fn execute(&self, stmt: &mut Statement) -> Result<(), Error> {
+        execute(stmt, &self.io)
     }
 
     /// False once turso ended the transaction itself, as it does when a

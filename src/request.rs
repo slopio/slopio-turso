@@ -36,6 +36,11 @@ pub(crate) enum Body {
         statement: &'static Write,
         params: Vec<Value>,
     },
+    /// Asks for writes that commit together or not at all, answered like a
+    /// `Write`.
+    Transaction {
+        writes: Vec<(&'static Write, Vec<Value>)>,
+    },
     Written(Result<(), Error>),
 }
 

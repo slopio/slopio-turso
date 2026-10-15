@@ -22,7 +22,7 @@ impl Write {
             Kind::Write | Kind::Unknown => Write { sql },
             Kind::Read => panic!("this statement only reads: declare it as a `Read`"),
             Kind::Transaction => {
-                panic!("transactions are opened and ended through the transaction API")
+                panic!("run writes together with `Client::transaction`")
             }
             Kind::Forbidden => panic!(
                 "PRAGMA, ATTACH, DETACH and VACUUM INTO statements could reconfigure the \

@@ -7,6 +7,9 @@
 //! commit at once; otherwise they wait for the interval to pass, and so do the
 //! writes that arrive meanwhile.
 //!
+//! A client's transaction runs in a savepoint of the open transaction: when
+//! one of its writes fails, the savepoint undoes the others, and only them.
+//!
 //! Past `wal_limit` pages of WAL, after a commit, the writer closes the
 //! readers' gate and empties the WAL.
 
@@ -14,12 +17,12 @@ use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::SyncMode;
+use turso_core::{Statement, SyncMode, Value};
 
-use crate::Error;
 use crate::conn::{self, Conn};
 use crate::db::{Config, Shared, Synchronous};
 use crate::request::{Body, Msg, reply};
+use crate::{Error, Write};
 
 /// The most writes one transaction serves: a full batch commits at once.
 pub(crate) const MAX_BATCH: usize = 256;
@@ -37,6 +40,10 @@ pub(crate) struct Writer {
     last_commit: Option<Instant>,
     /// The open transaction's writes with their outcome, held until it commits.
     held: Vec<(Msg, Result<(), Error>)>,
+    /// Around a client's transaction.
+    savepoint: Statement,
+    release: Statement,
+    rollback_to: Statement,
 }
 
 impl Writer {
@@ -47,6 +54,9 @@ impl Writer {
             Synchronous::Normal => SyncMode::Normal,
         });
         Ok(Writer {
+            savepoint: conn.prepare("SAVEPOINT tx")?,
+            release: conn.prepare("RELEASE tx")?,
+            rollback_to: conn.prepare("ROLLBACK TO tx")?,
             conn,
             shared: shared.clone(),
             commit_interval: config.commit_interval,
@@ -128,12 +138,41 @@ impl Writer {
     }
 
     fn run(&mut self, msg: &Msg) -> Result<(), Error> {
-        let Body::Write { statement, params } = msg.payload.body() else {
-            unreachable!("only writes reach the writer");
-        };
-        let (statement, params) = (*statement, mem::take(params));
+        match msg.payload.body() {
+            Body::Write { statement, params } => self.statement(statement, mem::take(params)),
+            Body::Transaction { writes } => self.transaction(mem::take(writes)),
+            _ => unreachable!("only writes reach the writer"),
+        }
+    }
+
+    fn statement(&mut self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
         self.conn
             .run(statement.key(), statement.sql(), params, conn::none)
+    }
+
+    /// Runs `writes` in order, in a savepoint: the first that fails undoes
+    /// the others, and is the answer.
+    fn transaction(&mut self, writes: Vec<(&'static Write, Vec<Value>)>) -> Result<(), Error> {
+        self.conn.execute(&mut self.savepoint)?;
+        let ran = writes
+            .into_iter()
+            .try_for_each(|(statement, params)| self.statement(statement, params));
+        // turso ends the whole transaction on some failures: no savepoint is
+        // left then, and the writer fails the batch.
+        if self.conn.in_transaction() {
+            let undone = match ran {
+                Ok(()) => Ok(()),
+                Err(_) => self.conn.execute(&mut self.rollback_to),
+            };
+            let released = undone.and_then(|()| self.conn.execute(&mut self.release));
+            if let Err(error) = released {
+                // The savepoint is in an unknown state: undo the batch rather
+                // than commit half a transaction.
+                self.conn.rollback();
+                return Err(error);
+            }
+        }
+        ran
     }
 
     /// The held writes that had succeeded are undone: they get `error`.

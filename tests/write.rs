@@ -1,6 +1,7 @@
 //! Writes cross to the DB thread's writer; each answer tells the truth: a write
 //! answered `Ok` is in the database, one answered `Err` is not, even when
-//! another write of its batch failed. A read after a write sees it.
+//! another write of its batch failed. A read after a write sees it. A
+//! transaction lands whole or not at all, and only its own writes with it.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -100,6 +101,43 @@ fn every_write_is_answered_with_what_happened() {
                         assert!(matches!(written, Err(Error::Turso(_))), "{written:?}");
                     }
                 }
+
+                // A transaction whose second write fails, id 2 existing, and a
+                // write sent with it, likely in the same batch.
+                let c = client.clone();
+                let failed = slopio::spawn(async move {
+                    c.transaction(vec![
+                        (&INSERT_USER, vec![int(30), Value::build_text("in tx")]),
+                        (&INSERT_USER, vec![int(2), Value::build_text("in tx")]),
+                    ])
+                    .await
+                });
+                let c = client.clone();
+                let neighbour = slopio::spawn(async move {
+                    let name = Value::build_text("neighbour");
+                    c.write(&INSERT_USER, vec![int(31), name]).await
+                });
+                let failed = failed.await;
+                assert!(matches!(failed, Err(Error::Turso(_))), "{failed:?}");
+                neighbour.await.unwrap();
+                let undone = client.read_one::<User>(&GET_USER, vec![int(30)]).await;
+                assert_eq!(undone.unwrap(), None);
+                let kept = client.read_one::<User>(&GET_USER, vec![int(31)]).await;
+                assert_eq!(kept.unwrap().unwrap().name, "neighbour");
+
+                // One that succeeds lands whole.
+                client
+                    .transaction(vec![
+                        (&INSERT_USER, vec![int(40), Value::build_text("first")]),
+                        (&INSERT_USER, vec![int(41), Value::build_text("second")]),
+                    ])
+                    .await
+                    .unwrap();
+                for id in [40, 41] {
+                    let row = client.read_one::<User>(&GET_USER, vec![int(id)]).await;
+                    assert!(row.unwrap().is_some(), "transaction write {id}");
+                }
+                assert!(client.transaction(vec![]).await.is_ok());
             };
             let finished = matches!(
                 select(work, Sleep::during(TIMEOUT)).await,

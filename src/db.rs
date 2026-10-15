@@ -154,7 +154,7 @@ fn take(opened: &Opened, msg: Msg, writes: &mut Vec<Msg>) {
             reply(msg, Body::Opened(shared.map_err(Error::clone)));
         }
         Body::Doorbell => {}
-        Body::Write { .. } => writes.push(msg),
+        Body::Write { .. } | Body::Transaction { .. } => writes.push(msg),
         Body::Opened(_) | Body::Written(_) => unreachable!("an answer sent as a request"),
     }
 }
