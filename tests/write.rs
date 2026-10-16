@@ -192,6 +192,89 @@ fn every_write_is_answered_with_what_happened() {
     assert!(rx.recv().unwrap(), "client: timed out");
 }
 
+#[test]
+fn a_write_never_committed_is_not_answered_ok() {
+    let path = format!("/tmp/slopio-turso-uncommitted-{}.db", std::process::id());
+    seed(&path);
+
+    let (tx, rx) = mpsc::channel();
+    let ring = RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
+    };
+    let mut topology = Topology::new();
+    let db_path = path.clone();
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let db_path = db_path.clone();
+        async move {
+            // The first commit is at once; the next one only a minute later.
+            let config = slopio_turso::db::Config {
+                commit_interval: Duration::from_secs(60),
+                ..Default::default()
+            };
+            let stop = select(recv_from_peer(), Sleep::during(TIMEOUT));
+            match select(slopio_turso::db::serve(&db_path, config), stop).await {
+                SelectResult::First(()) => unreachable!("serve never returns"),
+                // Dropped with a write held for its commit.
+                SelectResult::Second(SelectResult::First(_stop)) => {}
+                SelectResult::Second(SelectResult::Second(())) => panic!("DB thread: timed out"),
+            }
+        }
+    });
+    topology.group::<(), _, _>(Threads::Auto(1), ring, move |_| {
+        let tx = tx.clone();
+        async move {
+            // SAFETY: the first group, thread DB_THREAD, runs `serve`.
+            let client = unsafe { Client::connect(DB_THREAD) }.await.unwrap();
+            let work = async {
+                let name = Value::build_text("committed");
+                client
+                    .write(&INSERT_USER, vec![int(49), name])
+                    .await
+                    .unwrap();
+                let c = client.clone();
+                let held = slopio::spawn(async move {
+                    let name = Value::build_text("held");
+                    c.write(&INSERT_USER, vec![int(50), name]).await
+                });
+                // Long enough for the writer to run it and hold it.
+                Sleep::during(Duration::from_millis(50)).await;
+                send_to_peer(DB_THREAD, 0, 0);
+                let held = held.await;
+                assert!(matches!(held, Err(Error::RolledBack)), "{held:?}");
+            };
+            let finished = matches!(
+                select(work, Sleep::during(TIMEOUT)).await,
+                SelectResult::First(())
+            );
+            tx.send(finished).unwrap();
+        }
+    });
+    topology.run();
+    assert!(rx.recv().unwrap(), "client: timed out");
+    assert_eq!(
+        ids(&path),
+        [1, 2, 3, 49],
+        "the held write is not in the database"
+    );
+    remove(&path);
+}
+
+/// Every user's id, read straight from the file.
+fn ids(path: &str) -> Vec<i64> {
+    let options = OpenOptions::new(Arc::new(SqliteDialect));
+    let db = Database::open(Arc::new(UnixIO::new().unwrap()), path, options).unwrap();
+    let conn = db.connect().unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    rows.iter()
+        .map(|row| match row[0] {
+            Value::Numeric(Numeric::Integer(id)) => id,
+            ref other => panic!("not an id: {other:?}"),
+        })
+        .collect()
+}
+
 fn seed(path: &str) {
     remove(path);
     let options = OpenOptions::new(Arc::new(SqliteDialect));

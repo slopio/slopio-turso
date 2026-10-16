@@ -12,8 +12,9 @@ pub enum Error {
     NoColumn(usize),
     /// A statement answering an `Option` gave more than one row.
     TooManyRows,
-    /// The write succeeded, but a later write of its batch failed and turso
-    /// rolled the whole transaction back.
+    /// The write succeeded, but its batch was not committed: a later write of
+    /// it failed and turso rolled the whole transaction back, or the writer
+    /// stopped before committing it.
     RolledBack,
 }
 

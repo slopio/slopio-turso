@@ -184,6 +184,14 @@ impl Writer {
     }
 }
 
+impl Drop for Writer {
+    /// The held writes were never committed: dropping them answers them, and
+    /// they must not answer what they ran.
+    fn drop(&mut self) {
+        self.fail_held(Error::RolledBack);
+    }
+}
+
 /// One statement, answering what its rows decode into.
 pub(crate) struct Single<R: 'static> {
     pub(crate) statement: &'static Write<R>,
