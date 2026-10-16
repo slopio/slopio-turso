@@ -10,11 +10,21 @@ use turso_core::{
     CheckpointMode, Connection, Database, IO, LimboError, Statement, StepResult, SyncMode,
 };
 
-use crate::row::{FromRow, Row};
+use crate::row::{Returned, Row};
 use crate::{Error, Params};
 
-/// Steps a bound statement to its end, decoding its rows into an `R`.
-pub(crate) type Decode<R> = fn(&mut Statement, &Arc<dyn IO>) -> Result<R, Error>;
+/// A bound statement's rows, as [`Returned::decode`] steps them.
+pub struct Rows<'a> {
+    stmt: &'a mut Statement,
+    io: &'a Arc<dyn IO>,
+}
+
+impl Rows<'_> {
+    /// Steps the statement to its end, handing every row to `f`.
+    pub(crate) fn for_each(self, f: impl FnMut(Row<'_>) -> Result<(), Error>) -> Result<(), Error> {
+        for_each_row(self.stmt, self.io, f)
+    }
+}
 
 pub(crate) struct Conn {
     conn: Arc<Connection>,
@@ -112,50 +122,22 @@ impl Conn {
     }
 
     /// Runs the statement `sql`, prepared once and cached under `key`, with
-    /// `params`; `decode` turns its rows into the answer.
-    pub(crate) fn run<R>(
+    /// `params`; its rows are decoded into an `R`.
+    pub(crate) fn run<R: Returned>(
         &mut self,
         key: usize,
         sql: &'static str,
         params: impl Params,
-        decode: Decode<R>,
     ) -> Result<R, Error> {
         let stmt = match self.statements.entry(key) {
             Entry::Occupied(prepared) => prepared.into_mut(),
             Entry::Vacant(entry) => entry.insert(self.conn.prepare(sql)?),
         };
-        let answer = bind(stmt, params).and_then(|()| decode(stmt, &self.io));
+        let io = &self.io;
+        let answer = bind(stmt, params).and_then(|()| R::decode(Rows { stmt, io }));
         stmt.reset()?;
         answer
     }
-}
-
-/// Every row, as a `Vec<T>`.
-pub(crate) fn all<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<Vec<T>, Error> {
-    let mut rows = Vec::<T>::new();
-    for_each_row(stmt, io, |row| {
-        rows.push(T::from_row(&row)?);
-        Ok(())
-    })?;
-    Ok(rows)
-}
-
-/// The row if there is one, as an `Option<T>`; more than one is an error.
-pub(crate) fn one<T: FromRow>(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<Option<T>, Error> {
-    let mut first = None::<T>;
-    for_each_row(stmt, io, |row| {
-        if first.is_some() {
-            return Err(Error::TooManyRows);
-        }
-        first = Some(T::from_row(&row)?);
-        Ok(())
-    })?;
-    Ok(first)
-}
-
-/// No rows wanted: `()`.
-pub(crate) fn none(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<(), Error> {
-    for_each_row(stmt, io, |_| Ok(()))
 }
 
 /// Binds every parameter: `reset` keeps the previous values, so one left out

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use turso_core::{Database, Value};
 
-use crate::conn::{self, Conn};
+use crate::conn::Conn;
 use crate::db::Shared;
 use crate::reader::{self, Queue};
 use crate::request::{self, Body};
@@ -69,7 +69,7 @@ impl Client {
         params: impl Params,
     ) -> Result<Vec<T>, Error> {
         self.reads
-            .read(statement.key(), statement.sql(), params, conn::all::<T>)
+            .read::<Vec<T>>(statement.key(), statement.sql(), params)
             .await
     }
 
@@ -81,7 +81,7 @@ impl Client {
         params: impl Params,
     ) -> Result<Option<T>, Error> {
         self.reads
-            .read(statement.key(), statement.sql(), params, conn::one::<T>)
+            .read::<Option<T>>(statement.key(), statement.sql(), params)
             .await
     }
 

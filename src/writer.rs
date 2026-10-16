@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use turso_core::{Statement, SyncMode, Value};
 
-use crate::conn::{self, Conn};
+use crate::conn::Conn;
 use crate::db::{Config, Shared, Synchronous};
 use crate::request::{Body, Msg, reply};
 use crate::{Error, Write};
@@ -147,7 +147,7 @@ impl Writer {
 
     fn statement(&mut self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
         self.conn
-            .run(statement.key(), statement.sql(), params, conn::none)
+            .run::<()>(statement.key(), statement.sql(), params)
     }
 
     /// Runs `writes` in order, in a savepoint: the first that fails undoes

@@ -19,10 +19,50 @@
 use turso_core::{FromValueRow, Value};
 
 use crate::Error;
+use crate::conn::Rows;
 
 /// Builds a value from one row of a read.
 pub trait FromRow: Sized + 'static {
     fn from_row(row: &Row<'_>) -> Result<Self, Error>;
+}
+
+/// What a statement answers, decoded from its rows as they are stepped: `()`
+/// when none are wanted, `Option<T>` for at most one, `Vec<T>` for every one.
+pub trait Returned: Sized + 'static {
+    #[doc(hidden)]
+    fn decode(rows: Rows<'_>) -> Result<Self, Error>;
+}
+
+impl Returned for () {
+    fn decode(rows: Rows<'_>) -> Result<Self, Error> {
+        rows.for_each(|_| Ok(()))
+    }
+}
+
+/// More than one row is an error.
+impl<T: FromRow> Returned for Option<T> {
+    fn decode(rows: Rows<'_>) -> Result<Self, Error> {
+        let mut first = None;
+        rows.for_each(|row| {
+            if first.is_some() {
+                return Err(Error::TooManyRows);
+            }
+            first = Some(T::from_row(&row)?);
+            Ok(())
+        })?;
+        Ok(first)
+    }
+}
+
+impl<T: FromRow> Returned for Vec<T> {
+    fn decode(rows: Rows<'_>) -> Result<Self, Error> {
+        let mut all = Vec::new();
+        rows.for_each(|row| {
+            all.push(T::from_row(&row)?);
+            Ok(())
+        })?;
+        Ok(all)
+    }
 }
 
 /// The row being read. Only valid while it is decoded: the next step of the

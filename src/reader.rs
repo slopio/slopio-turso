@@ -18,8 +18,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use crate::conn::{Conn, Decode};
+use crate::conn::Conn;
 use crate::db::Shared;
+use crate::row::Returned;
 use crate::{Error, Params};
 
 /// The most reads one read transaction serves.
@@ -33,7 +34,6 @@ struct Slot<R, P> {
     sql: &'static str,
     /// Taken by the reader.
     params: Cell<Option<P>>,
-    decode: Decode<R>,
     result: Cell<Option<Result<R, Error>>>,
     /// The task that asked, while it sleeps.
     waker: Cell<Option<Waker>>,
@@ -46,10 +46,10 @@ trait Job {
     fn run(&self, conn: &mut Conn);
 }
 
-impl<R, P: Params> Job for Slot<R, P> {
+impl<R: Returned, P: Params> Job for Slot<R, P> {
     fn run(&self, conn: &mut Conn) {
         let params = self.params.take().expect("a read runs once");
-        let answer = conn.run(self.key, self.sql, params, self.decode);
+        let answer = conn.run::<R>(self.key, self.sql, params);
         self.result.set(Some(answer));
         if let Some(task) = self.waker.take() {
             task.wake();
@@ -71,19 +71,17 @@ impl Queue {
         }
     }
 
-    /// Queues a read and waits for its rows, which `decode` turns into an `R`.
-    pub(crate) async fn read<R: 'static>(
+    /// Queues a read and waits for its rows, decoded into an `R`.
+    pub(crate) async fn read<R: Returned>(
         &self,
         key: usize,
         sql: &'static str,
         params: impl Params,
-        decode: Decode<R>,
     ) -> Result<R, Error> {
         let slot = Rc::new(Slot {
             key,
             sql,
             params: Cell::new(Some(params)),
-            decode,
             result: Cell::new(None),
             waker: Cell::new(None),
         });
