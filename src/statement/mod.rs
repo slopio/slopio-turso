@@ -3,13 +3,22 @@
 //! - A [`Read`] runs on the calling thread's own read connection.
 //! - A [`Write`] crosses to the writer and is answered after its batch commits.
 //!
-//! Define each statement as a `static`, from a string literal:
+//! Define each statement as a `static`, from a string literal, typed by what
+//! its rows decode into:
 //!
 //! ```
-//! use slopio_turso::{Read, Write, read_sql, write_sql};
+//! use slopio_turso::{Error, FromRow, Read, Row, Write, read_sql, write_sql};
 //!
-//! static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
-//! static ADD_USER: Write = write_sql!("INSERT INTO users (name) VALUES (?1) RETURNING id");
+//! struct Name(String);
+//!
+//! impl FromRow for Name {
+//!     fn from_row(row: &Row<'_>) -> Result<Self, Error> {
+//!         Ok(Name(row.get(0)?))
+//!     }
+//! }
+//!
+//! static GET_NAME: Read<Option<Name>> = read_sql!("SELECT name FROM users WHERE id = ?1");
+//! static RENAME: Write = write_sql!("UPDATE users SET name = ?2 WHERE id = ?1");
 //! ```
 //!
 //! Its address is its identity: the key of every connection's statement cache.
@@ -24,7 +33,7 @@
 //!
 //! let table = String::from("users");
 //! let sql: &'static str = format!("SELECT * FROM {table}").leak();
-//! let read: Read = read_sql!(sql);
+//! let read: Read<()> = read_sql!(sql);
 //! ```
 //!
 //! They check the SQL at compile time, so what they refuse is a compile
@@ -35,7 +44,7 @@
 //! ```compile_fail
 //! use slopio_turso::{Read, read_sql};
 //!
-//! static SNEAKY: Read = read_sql!("DELETE FROM users");
+//! static SNEAKY: Read<()> = read_sql!("DELETE FROM users");
 //! ```
 //!
 //! ```compile_fail
@@ -77,8 +86,8 @@ mod tests {
 
     #[test]
     fn each_static_is_its_own_statement() {
-        static A: Read = read_sql!("SELECT 1");
-        static B: Read = read_sql!("SELECT 1");
+        static A: Read<()> = read_sql!("SELECT 1");
+        static B: Read<()> = read_sql!("SELECT 1");
         static C: Write = write_sql!("CREATE TABLE t (x)");
         assert_ne!(A.key(), B.key());
         assert_eq!(A.key(), A.key());
@@ -87,7 +96,7 @@ mod tests {
 
     #[test]
     fn a_cte_is_accepted_on_either_side() {
-        static READ: Read = read_sql!("WITH x AS (SELECT 1) SELECT * FROM x");
+        static READ: Read<()> = read_sql!("WITH x AS (SELECT 1) SELECT * FROM x");
         static WRITE: Write = write_sql!("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x");
         assert!(READ.sql().starts_with("WITH"));
         assert!(WRITE.sql().starts_with("WITH"));

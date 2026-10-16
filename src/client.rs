@@ -10,7 +10,7 @@ use crate::db::Shared;
 use crate::job;
 use crate::reader::{self, Queue};
 use crate::request::{self, Body};
-use crate::row::{FromRow, Returned};
+use crate::row::Returned;
 use crate::writer::{Single, Transaction};
 use crate::{Error, Read, Write};
 
@@ -63,27 +63,15 @@ impl Client {
         })
     }
 
-    /// Runs `statement` with `params` on this worker's read connection, every
-    /// row decoded as a `T`.
-    pub async fn read<T: FromRow>(
+    /// Runs `statement` with `params` on this worker's read connection, and
+    /// answers what its rows decode into.
+    pub async fn read<R: Returned>(
         &self,
-        statement: &'static Read,
+        statement: &'static Read<R>,
         params: impl Params,
-    ) -> Result<Vec<T>, Error> {
+    ) -> Result<R, Error> {
         self.reads
-            .read::<Vec<T>>(statement.key(), statement.sql(), params)
-            .await
-    }
-
-    /// Like [`read`](Self::read), for a statement that gives at most one row:
-    /// more is an error.
-    pub async fn read_one<T: FromRow>(
-        &self,
-        statement: &'static Read,
-        params: impl Params,
-    ) -> Result<Option<T>, Error> {
-        self.reads
-            .read::<Option<T>>(statement.key(), statement.sql(), params)
+            .read::<R>(statement.key(), statement.sql(), params)
             .await
     }
 

@@ -15,12 +15,16 @@ use turso_core::{Database, Numeric, OpenOptions, SqliteDialect, UnixIO, Value};
 const DB_THREAD: usize = 0;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
-static ALL_USERS: Read = read_sql!("SELECT id, name FROM users ORDER BY id");
-static MISSING: Read = read_sql!("SELECT * FROM missing");
-static BAD_JSON: Read = read_sql!("SELECT json_extract('{oops', '$'), 'x'");
+static GET_USER: Read<Option<User>> = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static ALL_USERS: Read<Vec<User>> = read_sql!("SELECT id, name FROM users ORDER BY id");
+/// Gives every user where at most one is expected.
+static ONE_OF_ALL: Read<Option<User>> = read_sql!("SELECT id, name FROM users ORDER BY id");
+static THIRD_OF_ALL: Read<Vec<Third>> = read_sql!("SELECT id, name FROM users ORDER BY id");
+static MISSING: Read<Vec<User>> = read_sql!("SELECT * FROM missing");
+static BAD_JSON: Read<Vec<User>> = read_sql!("SELECT json_extract('{oops', '$'), 'x'");
 /// Reads like a `SELECT` up to its `INSERT`.
-static SNEAKY: Read = read_sql!("WITH x AS (SELECT 4, 'd') INSERT INTO users SELECT * FROM x");
+static SNEAKY: Read<Vec<User>> =
+    read_sql!("WITH x AS (SELECT 4, 'd') INSERT INTO users SELECT * FROM x");
 
 #[derive(Debug, PartialEq)]
 struct User {
@@ -90,35 +94,32 @@ fn each_read_of_a_batch_gets_its_own_answer() {
             let client = unsafe { Client::connect(DB_THREAD) }.await.unwrap();
             // Every read is spawned before any runs: they reach the reader together.
             let c = client.clone();
-            let one = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(2)).await });
+            let one = slopio::spawn(async move { c.read(&GET_USER, id(2)).await });
             let c = client.clone();
-            let none = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(9)).await });
+            let none = slopio::spawn(async move { c.read(&GET_USER, id(9)).await });
             let c = client.clone();
-            let all = slopio::spawn(async move { c.read::<User>(&ALL_USERS, vec![]).await });
+            let all = slopio::spawn(async move { c.read(&ALL_USERS, vec![]).await });
             let c = client.clone();
-            let too_many =
-                slopio::spawn(async move { c.read_one::<User>(&ALL_USERS, vec![]).await });
+            let too_many = slopio::spawn(async move { c.read(&ONE_OF_ALL, vec![]).await });
             let c = client.clone();
-            let no_param =
-                slopio::spawn(async move { c.read_one::<User>(&GET_USER, vec![]).await });
+            let no_param = slopio::spawn(async move { c.read(&GET_USER, vec![]).await });
             let c = client.clone();
             let two_params = slopio::spawn(async move {
                 let params = vec![id(1).remove(0), id(1).remove(0)];
-                c.read_one::<User>(&GET_USER, params).await
+                c.read(&GET_USER, params).await
             });
             let c = client.clone();
-            let no_column = slopio::spawn(async move { c.read::<Third>(&ALL_USERS, vec![]).await });
+            let no_column = slopio::spawn(async move { c.read(&THIRD_OF_ALL, vec![]).await });
             let c = client.clone();
-            let missing = slopio::spawn(async move { c.read::<User>(&MISSING, vec![]).await });
+            let missing = slopio::spawn(async move { c.read(&MISSING, vec![]).await });
             let c = client.clone();
-            let bad_json = slopio::spawn(async move { c.read::<User>(&BAD_JSON, vec![]).await });
+            let bad_json = slopio::spawn(async move { c.read(&BAD_JSON, vec![]).await });
             let c = client.clone();
-            let sneaky = slopio::spawn(async move { c.read::<User>(&SNEAKY, vec![]).await });
+            let sneaky = slopio::spawn(async move { c.read(&SNEAKY, vec![]).await });
             let c = client.clone();
-            let after = slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(3)).await });
+            let after = slopio::spawn(async move { c.read(&GET_USER, id(3)).await });
             let c = client.clone();
-            let not_written =
-                slopio::spawn(async move { c.read_one::<User>(&GET_USER, id(4)).await });
+            let not_written = slopio::spawn(async move { c.read(&GET_USER, id(4)).await });
 
             let work = async {
                 let one = one.await.unwrap();

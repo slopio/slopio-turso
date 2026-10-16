@@ -10,7 +10,7 @@ pub enum Error {
     Parameters { expected: usize, given: usize },
     /// The row has no column at this index.
     NoColumn(usize),
-    /// `read_one` got more than one row.
+    /// A statement answering an `Option` gave more than one row.
     TooManyRows,
     /// The write succeeded, but a later write of its batch failed and turso
     /// rolled the whole transaction back.
@@ -44,7 +44,7 @@ impl fmt::Display for Error {
                 )
             }
             Error::NoColumn(index) => write!(f, "the row has no column {index}"),
-            Error::TooManyRows => f.write_str("more than one row for read_one"),
+            Error::TooManyRows => f.write_str("more than one row for an `Option`"),
             Error::RolledBack => f.write_str("rolled back with its batch"),
         }
     }

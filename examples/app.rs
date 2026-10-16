@@ -40,11 +40,12 @@ const POSTS: u64 = 300_000;
 /// server would rather than queue without end.
 const MAX_IN_FLIGHT: usize = 10_000;
 
-static GET_USER: Read = read_sql!("SELECT id, name, email, last_seen FROM users WHERE id = ?1");
-static USER_POSTS: Read = read_sql!(
+static GET_USER: Read<Option<User>> =
+    read_sql!("SELECT id, name, email, last_seen FROM users WHERE id = ?1");
+static USER_POSTS: Read<Vec<Post>> = read_sql!(
     "SELECT id, user_id, created_at, body FROM posts WHERE user_id = ?1 ORDER BY id DESC LIMIT 20",
 );
-static RECENT_POSTS: Read =
+static RECENT_POSTS: Read<Vec<Post>> =
     read_sql!("SELECT id, user_id, created_at, body FROM posts ORDER BY id DESC LIMIT 20");
 static NEW_POST: Write =
     write_sql!("INSERT INTO posts (user_id, created_at, body) VALUES (?1, ?2, ?3)");
@@ -279,7 +280,7 @@ async fn request(client: &Client, kind: Kind, user: i64, due: Instant, work: Dur
     let now = || Value::Numeric(Numeric::Integer(due.elapsed().as_nanos() as i64));
     match kind {
         Kind::Profile => {
-            let found: Option<User> = client.read_one(&GET_USER, [id()]).await.unwrap();
+            let found: Option<User> = client.read(&GET_USER, [id()]).await.unwrap();
             assert!(found.is_some());
             let posts: Vec<Post> = client.read(&USER_POSTS, [id()]).await.unwrap();
             assert!(posts.len() <= 20);

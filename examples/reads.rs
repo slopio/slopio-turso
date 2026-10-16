@@ -31,7 +31,7 @@ const ROWS: u64 = 100_000;
 /// One read in this many has its latency recorded.
 const READ_SAMPLE: u64 = 64;
 
-static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static GET_USER: Read<Option<User>> = read_sql!("SELECT id, name FROM users WHERE id = ?1");
 static RENAME_USER: Write = write_sql!("UPDATE users SET name = ?2 WHERE id = ?1");
 
 struct User {
@@ -182,11 +182,7 @@ async fn work(client: Client, seed: u64, deadline: Instant, writes: u64) -> Tall
             tally.writes += 1;
         } else {
             let start = Instant::now();
-            let user: User = client
-                .read_one(&GET_USER, [id_param])
-                .await
-                .unwrap()
-                .unwrap();
+            let user: User = client.read(&GET_USER, [id_param]).await.unwrap().unwrap();
             assert!(user.id == id && !user.name.is_empty());
             if tally.reads % READ_SAMPLE == 0 {
                 tally.read_latencies.push(start.elapsed());

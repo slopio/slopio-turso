@@ -19,7 +19,7 @@ const DB_THREAD: usize = 0;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 static INSERT_USER: Write = write_sql!("INSERT INTO users (id, name) VALUES (?1, ?2)");
-static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static GET_USER: Read<Option<User>> = read_sql!("SELECT id, name FROM users WHERE id = ?1");
 static ADD_USER: Write<Option<User>> =
     write_sql!("INSERT INTO users (name) VALUES (?1) RETURNING id, name");
 static SHOUT: Write<Vec<User>> =
@@ -80,7 +80,7 @@ fn every_write_is_answered_with_what_happened() {
                     .write(&INSERT_USER, vec![int(10), name])
                     .await
                     .unwrap();
-                let alice = client.read_one::<User>(&GET_USER, vec![int(10)]).await;
+                let alice = client.read(&GET_USER, vec![int(10)]).await;
                 assert_eq!(alice.unwrap().unwrap().name, "alice");
 
                 // Sent together, so they likely share a batch; id 1 already exists.
@@ -96,10 +96,7 @@ fn every_write_is_answered_with_what_happened() {
                     .collect();
                 for write in writes {
                     let (id, written) = write.await;
-                    let row = client
-                        .read_one::<User>(&GET_USER, vec![int(id)])
-                        .await
-                        .unwrap();
+                    let row = client.read(&GET_USER, vec![int(id)]).await.unwrap();
                     let new = row.is_some_and(|user| user.name.ends_with("-new"));
                     assert_eq!(written.is_ok(), new, "write {id} answered {written:?}");
                     if id == 1 {
@@ -125,9 +122,9 @@ fn every_write_is_answered_with_what_happened() {
                 let failed = failed.await;
                 assert!(matches!(failed, Err(Error::Turso(_))), "{failed:?}");
                 neighbour.await.unwrap();
-                let undone = client.read_one::<User>(&GET_USER, vec![int(30)]).await;
+                let undone = client.read(&GET_USER, vec![int(30)]).await;
                 assert_eq!(undone.unwrap(), None);
-                let kept = client.read_one::<User>(&GET_USER, vec![int(31)]).await;
+                let kept = client.read(&GET_USER, vec![int(31)]).await;
                 assert_eq!(kept.unwrap().unwrap().name, "neighbour");
 
                 // One that succeeds lands whole.
@@ -139,7 +136,7 @@ fn every_write_is_answered_with_what_happened() {
                     .await
                     .unwrap();
                 for id in [40, 41] {
-                    let row = client.read_one::<User>(&GET_USER, vec![int(id)]).await;
+                    let row = client.read(&GET_USER, vec![int(id)]).await;
                     assert!(row.unwrap().is_some(), "transaction write {id}");
                 }
                 assert!(client.transaction(vec![]).await.is_ok());
@@ -159,9 +156,7 @@ fn every_write_is_answered_with_what_happened() {
                 for add in adds {
                     let (name, added) = add.await;
                     assert_eq!(added.name, name);
-                    let row = client
-                        .read_one::<User>(&GET_USER, vec![int(added.id)])
-                        .await;
+                    let row = client.read(&GET_USER, vec![int(added.id)]).await;
                     ids.push(added.id);
                     assert_eq!(row.unwrap(), Some(added));
                 }
