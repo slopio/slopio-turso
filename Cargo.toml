@@ -12,3 +12,12 @@ turso_core = { version = "=0.8.1", default-features = false, features = ["fs", "
 [dev-dependencies]
 # examples/engines.rs: the same workload on SQLite, to compare.
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+# A panic stops the process at once, without running a destructor: nothing
+# can answer a write that was not committed, and no unwind goes through
+# slopio's runtime. Tests and benches ignore it: libtest needs to unwind.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
