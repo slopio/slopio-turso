@@ -9,13 +9,11 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering::SeqCst};
 
-use slopio::io_driver::Message;
-
-use crate::request::{Msg, Request};
+use crate::job::{Head, Held, Job, Request};
 
 pub(crate) struct Inbox {
     /// The last write pushed; each links to the one pushed before it.
-    head: AtomicPtr<Message<Request>>,
+    head: AtomicPtr<Head>,
     /// A doorbell was sent since the DB thread last emptied the stack: the
     /// next push need not send another.
     rung: AtomicBool,
@@ -29,13 +27,14 @@ impl Inbox {
         }
     }
 
-    /// Pushes `msg`; true when the caller must ring the doorbell.
-    pub(crate) fn push(&self, msg: Msg) -> bool {
-        let node = Arc::into_raw(msg).cast_mut();
+    /// Pushes `request`; true when the caller must ring the doorbell.
+    pub(crate) fn push<J: Job>(&self, request: Arc<Request<J>>) -> bool {
+        // `repr(C)`: the request starts with its head.
+        let node = Arc::into_raw(request).cast::<Head>().cast_mut();
         let mut head = self.head.load(SeqCst);
         loop {
             // SAFETY: `node` is ours until the CAS publishes it.
-            unsafe { (*node).payload.set_next(head) };
+            unsafe { (*node).set_next(head) };
             match self.head.compare_exchange_weak(head, node, SeqCst, SeqCst) {
                 Ok(_) => break,
                 Err(current) => head = current,
@@ -48,7 +47,7 @@ impl Inbox {
 
     /// For the DB thread: moves every write pushed so far into `into`, oldest
     /// first.
-    pub(crate) fn take(&self, into: &mut Vec<Msg>) {
+    pub(crate) fn take(&self, into: &mut Vec<Held>) {
         // Before the swap: a push the swap misses rings again.
         self.rung.store(false, SeqCst);
         let mut node = self.head.swap(ptr::null_mut(), SeqCst);
@@ -56,15 +55,16 @@ impl Inbox {
         while !node.is_null() {
             // SAFETY: every node was an `Arc` turned raw by `push`, and the
             // swap made the DB thread its only taker.
-            let msg = unsafe { Arc::from_raw(node) };
-            node = msg.payload.next();
-            into.push(msg);
+            let held = unsafe { Held::from_raw(node) };
+            node = held.next();
+            into.push(held);
         }
         into[start..].reverse();
     }
 }
 
 impl Drop for Inbox {
+    /// Answers what is left: cancelled writes, as no client is left to wait.
     fn drop(&mut self) {
         let mut writes = Vec::new();
         self.take(&mut writes);

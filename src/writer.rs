@@ -13,7 +13,6 @@
 //! Past `wal_limit` pages of WAL, after a commit, the writer closes the
 //! readers' gate and empties the WAL.
 
-use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +20,8 @@ use turso_core::{Statement, SyncMode, Value};
 
 use crate::conn::Conn;
 use crate::db::{Config, Shared, Synchronous};
-use crate::request::{Body, Msg, reply};
+use crate::job::{Held, Job};
+use crate::row::Returned;
 use crate::{Error, Write};
 
 /// The most writes one transaction serves: a full batch commits at once.
@@ -38,8 +38,8 @@ pub(crate) struct Writer {
     wal_limit: u64,
     /// When the last commit started; `None` before the first.
     last_commit: Option<Instant>,
-    /// The open transaction's writes with their outcome, held until it commits.
-    held: Vec<(Msg, Result<(), Error>)>,
+    /// The open transaction's writes, their answers held until it commits.
+    held: Vec<Held>,
     /// Around a client's transaction.
     savepoint: Statement,
     release: Statement,
@@ -68,22 +68,22 @@ impl Writer {
 
     /// Runs `writes` in the open transaction, opening one if needed. Their
     /// answers wait for the commit.
-    pub(crate) fn write(&mut self, writes: &mut Vec<Msg>) {
-        for msg in writes.drain(..) {
+    pub(crate) fn write(&mut self, writes: &mut Vec<Held>) {
+        for mut held in writes.drain(..) {
             // Nobody waits for this write anymore: never run it.
-            if msg.payload.is_cancelled() {
-                reply(msg, Body::Written(Ok(())));
+            if held.is_cancelled() {
+                held.reply();
                 continue;
             }
             if !self.conn.in_transaction()
                 && let Err(error) = self.conn.begin()
             {
-                reply(msg, Body::Written(Err(error)));
+                held.fail(&error);
+                held.reply();
                 continue;
             }
-            let written = self.run(&msg);
-            let failed = written.is_err();
-            self.held.push((msg, written));
+            let failed = !held.run(self);
+            self.held.push(held);
             if failed && !self.conn.in_transaction() {
                 // turso rolled the transaction back, and the earlier writes
                 // with it: their answers are final. The next write opens a
@@ -137,17 +137,12 @@ impl Writer {
         }
     }
 
-    fn run(&mut self, msg: &Msg) -> Result<(), Error> {
-        match msg.payload.body() {
-            Body::Write { statement, params } => self.statement(statement, mem::take(params)),
-            Body::Transaction { writes } => self.transaction(mem::take(writes)),
-            _ => unreachable!("only writes reach the writer"),
-        }
-    }
-
-    fn statement(&mut self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
-        self.conn
-            .run::<()>(statement.key(), statement.sql(), params)
+    fn statement<R: Returned>(
+        &mut self,
+        statement: &'static Write<R>,
+        params: Vec<Value>,
+    ) -> Result<R, Error> {
+        self.conn.run::<R>(statement.key(), statement.sql(), params)
     }
 
     /// Runs `writes` in order, in a savepoint: the first that fails undoes
@@ -177,16 +172,41 @@ impl Writer {
 
     /// The held writes that had succeeded are undone: they get `error`.
     fn fail_held(&mut self, error: Error) {
-        for (_, written) in &mut self.held {
-            if written.is_ok() {
-                *written = Err(error.clone());
-            }
+        for held in &mut self.held {
+            held.fail(&error);
         }
     }
 
     fn answer_held(&mut self) {
-        for (msg, written) in self.held.drain(..) {
-            reply(msg, Body::Written(written));
+        for held in self.held.drain(..) {
+            held.reply();
         }
+    }
+}
+
+/// One statement, answering what its rows decode into.
+pub(crate) struct Single<R: 'static> {
+    pub(crate) statement: &'static Write<R>,
+    pub(crate) params: Vec<Value>,
+}
+
+impl<R: Returned + Send> Job for Single<R> {
+    type Answer = R;
+
+    fn run(self, writer: &mut Writer) -> Result<R, Error> {
+        writer.statement(self.statement, self.params)
+    }
+}
+
+/// Writes that commit together or not at all.
+pub(crate) struct Transaction {
+    pub(crate) writes: Vec<(&'static Write, Vec<Value>)>,
+}
+
+impl Job for Transaction {
+    type Answer = ();
+
+    fn run(self, writer: &mut Writer) -> Result<(), Error> {
+        writer.transaction(self.writes)
     }
 }

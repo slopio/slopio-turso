@@ -1,7 +1,6 @@
-//! What a worker sends the DB thread, and how it gets its answer.
-//!
-//! A `Connect` goes over MSG_RING itself; writes go through the shared
-//! [`Inbox`], and MSG_RING only rings its doorbell.
+//! What a worker sends the DB thread over MSG_RING, and how it gets its
+//! answer: a `Connect`, and the doorbell of the shared inbox, which writes go
+//! through as [`job`](crate::job)s.
 //!
 //! The request is shared: the worker keeps a clone of the `Arc` and touches
 //! only `cancelled`; the DB thread replaces the body with its answer, drops its
@@ -9,19 +8,16 @@
 //! else holds the request anymore, so it takes the answer without a lock.
 
 use std::cell::UnsafeCell;
-use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use slopio::io_driver::{Endpoint, Header, Message};
 use slopio::runtime::{
     ReplySignal, send_msg_to_peer, send_shared_to_peer, signal_reply_to_peer, thread_id,
 };
-use turso_core::Value;
 
+use crate::Error;
 use crate::db::Shared;
-use crate::inbox::Inbox;
-use crate::{Error, Write};
 
 /// The question going out, then the answer coming back.
 pub(crate) enum Body {
@@ -31,17 +27,6 @@ pub(crate) enum Body {
     Opened(Result<Arc<Shared>, Error>),
     /// Writes were pushed into the inbox; not answered.
     Doorbell,
-    /// Asks for a write, answered once its batch has committed.
-    Write {
-        statement: &'static Write,
-        params: Vec<Value>,
-    },
-    /// Asks for writes that commit together or not at all, answered like a
-    /// `Write`.
-    Transaction {
-        writes: Vec<(&'static Write, Vec<Value>)>,
-    },
-    Written(Result<(), Error>),
 }
 
 /// A request as the DB thread holds it.
@@ -50,8 +35,6 @@ pub(crate) type Msg = Arc<Message<Request>>;
 pub(crate) struct Request {
     cancelled: AtomicBool,
     body: UnsafeCell<Body>,
-    /// In the inbox: the request pushed before this one.
-    next: AtomicPtr<Message<Request>>,
 }
 
 impl Request {
@@ -59,17 +42,7 @@ impl Request {
         Request {
             cancelled: AtomicBool::new(false),
             body: UnsafeCell::new(body),
-            next: AtomicPtr::new(ptr::null_mut()),
         }
-    }
-
-    /// For the inbox: published by the push, read by the take.
-    pub(crate) fn set_next(&self, next: *mut Message<Request>) {
-        self.next.store(next, Ordering::Relaxed);
-    }
-
-    pub(crate) fn next(&self) -> *mut Message<Request> {
-        self.next.load(Ordering::Relaxed)
     }
 
     /// The worker no longer waits for the answer.
@@ -122,26 +95,26 @@ pub(crate) async unsafe fn send(db_thread: usize, body: Body) -> Body {
     answer(signal, msg).await
 }
 
-/// Pushes `body` into the DB thread's `inbox`, rings its doorbell if nobody
-/// did since it last looked, and waits for the answer.
-pub(crate) async fn push(db_thread: usize, inbox: &Inbox, body: Body) -> Body {
-    let (signal, msg) = request(db_thread, body);
-    // The same sharing as `send`, through the inbox instead of the ring.
-    if inbox.push(Arc::clone(&msg)) {
-        send_msg_to_peer(db_thread, Request::new(Body::Doorbell));
-    }
-    answer(signal, msg).await
+/// Rings the DB thread's doorbell: writes are in the inbox.
+pub(crate) fn ring(db_thread: usize) {
+    send_msg_to_peer(db_thread, Request::new(Body::Doorbell));
 }
 
 /// A request for `db_thread`, and the slot its answer will wake.
 fn request(db_thread: usize, body: Body) -> (ReplySignal, Msg) {
     let signal = ReplySignal::reserve();
-    let header = Header::new(
+    let header = header(db_thread, &signal);
+    (signal, Message::with_header(header, Request::new(body)))
+}
+
+/// From this thread's `signal` to `db_thread`: where a request goes, and where
+/// its answer's wakeup comes back.
+pub(crate) fn header(db_thread: usize, signal: &ReplySignal) -> Header {
+    Header::new(
         Endpoint::with_slab(thread_id() as u16, signal.slot()),
         // Truncated, it would name another thread.
         Endpoint::new(u16::try_from(db_thread).expect("no such thread")),
-    );
-    (signal, Message::with_header(header, Request::new(body)))
+    )
 }
 
 async fn answer(signal: ReplySignal, msg: Msg) -> Body {

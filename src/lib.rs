@@ -10,6 +10,7 @@ pub mod db;
 mod error;
 mod gate;
 mod inbox;
+mod job;
 mod reader;
 mod request;
 mod row;

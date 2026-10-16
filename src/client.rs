@@ -7,9 +7,11 @@ use turso_core::{Database, Value};
 
 use crate::conn::Conn;
 use crate::db::Shared;
+use crate::job;
 use crate::reader::{self, Queue};
 use crate::request::{self, Body};
-use crate::row::FromRow;
+use crate::row::{FromRow, Returned};
+use crate::writer::{Single, Transaction};
 use crate::{Error, Read, Write};
 
 /// A statement's parameters, in order: a `Vec<Value>`, or an array
@@ -86,9 +88,14 @@ impl Client {
     }
 
     /// Sends `statement` with `params` to the DB thread's writer, and answers
-    /// once its batch has committed.
-    pub async fn write(&self, statement: &'static Write, params: Vec<Value>) -> Result<(), Error> {
-        self.push(Body::Write { statement, params }).await
+    /// once its batch has committed, with what its rows decode into.
+    pub async fn write<R: Returned + Send>(
+        &self,
+        statement: &'static Write<R>,
+        params: Vec<Value>,
+    ) -> Result<R, Error> {
+        let single = Single { statement, params };
+        job::push(self.db_thread, &self.shared.writes, single).await
     }
 
     /// Sends `writes` to the DB thread's writer, to run in order and commit
@@ -101,15 +108,8 @@ impl Client {
         if writes.is_empty() {
             return Ok(());
         }
-        self.push(Body::Transaction { writes }).await
-    }
-
-    async fn push(&self, body: Body) -> Result<(), Error> {
-        let Body::Written(written) = request::push(self.db_thread, &self.shared.writes, body).await
-        else {
-            unreachable!("a write is answered with `Written`");
-        };
-        written
+        let transaction = Transaction { writes };
+        job::push(self.db_thread, &self.shared.writes, transaction).await
     }
 
     pub fn database(&self) -> &Arc<Database> {

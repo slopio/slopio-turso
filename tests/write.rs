@@ -1,7 +1,8 @@
 //! Writes cross to the DB thread's writer; each answer tells the truth: a write
 //! answered `Ok` is in the database, one answered `Err` is not, even when
 //! another write of its batch failed. A read after a write sees it. A
-//! transaction lands whole or not at all, and only its own writes with it.
+//! transaction lands whole or not at all, and only its own writes with it. A
+//! write with `RETURNING` answers its own rows.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -19,6 +20,10 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 static INSERT_USER: Write = write_sql!("INSERT INTO users (id, name) VALUES (?1, ?2)");
 static GET_USER: Read = read_sql!("SELECT id, name FROM users WHERE id = ?1");
+static ADD_USER: Write<Option<User>> =
+    write_sql!("INSERT INTO users (name) VALUES (?1) RETURNING id, name");
+static SHOUT: Write<Vec<User>> =
+    write_sql!("UPDATE users SET name = upper(name) WHERE id IN (40, 41) RETURNING id, name");
 
 #[derive(Debug, PartialEq)]
 struct User {
@@ -138,6 +143,46 @@ fn every_write_is_answered_with_what_happened() {
                     assert!(row.unwrap().is_some(), "transaction write {id}");
                 }
                 assert!(client.transaction(vec![]).await.is_ok());
+
+                // Sent together, likely in one batch: each gets its own row back.
+                let adds: Vec<_> = ["dora", "emil"]
+                    .into_iter()
+                    .map(|name| {
+                        let c = client.clone();
+                        slopio::spawn(async move {
+                            let added = c.write(&ADD_USER, vec![Value::build_text(name)]).await;
+                            (name, added.unwrap().unwrap())
+                        })
+                    })
+                    .collect();
+                let mut ids = Vec::new();
+                for add in adds {
+                    let (name, added) = add.await;
+                    assert_eq!(added.name, name);
+                    let row = client
+                        .read_one::<User>(&GET_USER, vec![int(added.id)])
+                        .await;
+                    ids.push(added.id);
+                    assert_eq!(row.unwrap(), Some(added));
+                }
+                assert_ne!(ids[0], ids[1]);
+
+                // One row back per row changed.
+                let mut shouted = client.write(&SHOUT, vec![]).await.unwrap();
+                shouted.sort_by_key(|user| user.id);
+                assert_eq!(
+                    shouted,
+                    [
+                        User {
+                            id: 40,
+                            name: "FIRST".into()
+                        },
+                        User {
+                            id: 41,
+                            name: "SECOND".into()
+                        },
+                    ]
+                );
             };
             let finished = matches!(
                 select(work, Sleep::during(TIMEOUT)).await,

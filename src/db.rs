@@ -98,8 +98,8 @@ pub async fn serve(path: &str, config: Config) {
             },
         };
         if let Some(msg) = first {
-            take(&opened, msg, &mut writes);
-            drain(&opened, &mut writes).await;
+            take(&opened, msg);
+            drain(&opened).await;
         }
         match &mut opened {
             Ok((shared, writer)) => {
@@ -133,16 +133,14 @@ fn open(path: &str, config: &Config) -> Opened {
 /// Takes every message already sent. The runtime only moves so many arrivals
 /// into the thread's inbox per turn: while some came, yield to let it move the
 /// next ones.
-async fn drain(opened: &Opened, writes: &mut Vec<Msg>) {
+async fn drain(opened: &Opened) {
     loop {
         let mut came = false;
-        while writes.len() < MAX_BATCH
-            && let Some(msg) = try_recv().await
-        {
-            take(opened, msg, writes);
+        while let Some(msg) = try_recv().await {
+            take(opened, msg);
             came = true;
         }
-        if !came || writes.len() >= MAX_BATCH {
+        if !came {
             return;
         }
         slopio::yield_now().await;
@@ -151,15 +149,14 @@ async fn drain(opened: &Opened, writes: &mut Vec<Msg>) {
 
 /// Answers a `Connect` at once; a doorbell only woke the thread, the writes
 /// are in the inbox.
-fn take(opened: &Opened, msg: Msg, writes: &mut Vec<Msg>) {
+fn take(opened: &Opened, msg: Msg) {
     match msg.payload.body() {
         Body::Connect => {
             let shared = opened.as_ref().map(|(shared, _)| shared.clone());
             reply(msg, Body::Opened(shared.map_err(Error::clone)));
         }
         Body::Doorbell => {}
-        Body::Write { .. } | Body::Transaction { .. } => writes.push(msg),
-        Body::Opened(_) | Body::Written(_) => unreachable!("an answer sent as a request"),
+        Body::Opened(_) => unreachable!("an answer sent as a request"),
     }
 }
 
